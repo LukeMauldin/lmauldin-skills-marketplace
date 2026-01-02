@@ -1,0 +1,8 @@
+{
+  "name": "prompt-engineer-harness",
+  "description": "Expert prompt engineering skill for Claude, GPT, and Gemini in agentic harnesses",
+  "version": "1.0.0",
+  "author": {
+    "name": "Luke Mauldin"
+  }
+}

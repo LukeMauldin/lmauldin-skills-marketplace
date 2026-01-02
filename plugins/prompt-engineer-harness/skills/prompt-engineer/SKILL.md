@@ -1,6 +1,6 @@
 ---
 name: prompt-engineer
-description: "Act as an expert prompt engineer to create detailed, well-structured prompts. Use when asked to create, improve, or design prompts for LLMs. Produces prompts following the format: Role/Audience, Objective, Context, Final Instructions."
+description: "Prompt engineering skill for creating LLM prompts. Use when asked to 'load prompt engineering', 'create a prompt', 'write a prompt', 'design a prompt', or 'improve a prompt' for Claude, GPT, or Gemini."
 ---
 
 # Prompt Engineering Skill

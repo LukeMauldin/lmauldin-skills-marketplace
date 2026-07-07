@@ -1,0 +1,4 @@
+interface:
+  display_name: "Model Router"
+  short_description: "Route a task and optionally craft handoff"
+  default_prompt: "Use $model-router to recommend the best model and effort for this task, and optionally draft a handoff prompt for the chosen model."

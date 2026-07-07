@@ -1,0 +1,4 @@
+interface:
+  display_name: "Claude Session Inspector"
+  short_description: "Locate and inspect Claude Code session logs"
+  default_prompt: "Use $claude-session-inspector to locate, read, and summarize Claude Code session logs on this machine."

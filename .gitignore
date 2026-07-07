@@ -1,0 +1,9 @@
+backups/
+.DS_Store
+__pycache__/
+.pytest_cache/
+.venv/
+node_modules/
+*.db
+*.db-shm
+*.db-wal

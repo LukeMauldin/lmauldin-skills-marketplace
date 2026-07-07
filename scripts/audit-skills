@@ -1,0 +1,67 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+repo_dir="${0:A:h:h}"
+skills_dir="$repo_dir/skills"
+
+roots=(
+  "$HOME/.agents/skills"
+  "$HOME/.claude/skills"
+  "$HOME/.codex/skills"
+  "$HOME/.qwen/skills"
+  "$HOME/.pi/agent/skills"
+  "$HOME/.config/opencode/skills"
+  "$HOME/.cursor-homes/jb/.cursor/skills"
+  "$HOME/.cursor-homes/ks/.cursor/skills"
+)
+
+hash_skill() {
+  local dir="$1"
+  if [ ! -d "$dir" ]; then
+    printf 'MISSING'
+    return
+  fi
+  (
+    cd "$dir"
+    find . \
+      \( -name .git -o -name .jj -o -name .pytest_cache -o -name __pycache__ -o -name .venv -o -name node_modules \) -prune \
+      -o -type f ! -name .DS_Store -print0 |
+      sort -z |
+      xargs -0 shasum -a 256 2>/dev/null |
+      shasum -a 256 |
+      awk '{print $1}'
+  )
+}
+
+canonical_names=("${(@f)$(find "$skills_dir" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | sort)}")
+
+for root in "${roots[@]}"; do
+  printf '\n# %s\n' "$root"
+  if [ ! -d "$root" ]; then
+    printf 'missing root\n'
+    continue
+  fi
+
+  for name in "${canonical_names[@]}"; do
+    target="$root/$name"
+    canonical="$skills_dir/$name"
+    if [ ! -e "$target" ]; then
+      printf 'missing %s\n' "$name"
+      continue
+    fi
+    if [ -L "$target" ]; then
+      resolved="$(readlink "$target")"
+      case "$resolved" in
+        *"/mauldin-skills/skills/$name"|*"../../code/github.com/LukeMauldin/mauldin-skills/skills/$name"|*"../../.agents/skills/$name"|*"../../../.agents/skills/$name")
+          printf 'linked %s -> %s\n' "$name" "$resolved"
+          continue
+          ;;
+      esac
+    fi
+    if [ "$(hash_skill "$target")" = "$(hash_skill "$canonical")" ]; then
+      printf 'same %s\n' "$name"
+    else
+      printf 'drift %s\n' "$name"
+    fi
+  done
+done

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Cursor Session Inspector"
+  short_description: "Locate and inspect Cursor sessions."
+  default_prompt: "Use $cursor-session-inspector to locate, read, and summarize Cursor sessions on this machine."
+
+policy:
+  allow_implicit_invocation: false

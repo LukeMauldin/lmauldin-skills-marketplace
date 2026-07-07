@@ -1,0 +1,7 @@
+interface:
+  display_name: "Task Scout"
+  short_description: "Investigate work items and tighten scope."
+  default_prompt: "Use $scout-task to investigate this work item, inspect the evidence I point you to, ask only blocking clarification questions, and return a structured discovery brief or planning packet with recommended scope."
+
+policy:
+  allow_implicit_invocation: false

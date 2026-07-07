@@ -1,0 +1,7 @@
+interface:
+  display_name: "JB Linear"
+  short_description: "Manage JB Web Linear issues and workflows"
+  default_prompt: "Use $jb-linear to triage, update, or search relevant Linear issues for this task."
+
+policy:
+  allow_implicit_invocation: false

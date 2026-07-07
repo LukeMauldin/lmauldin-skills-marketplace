@@ -1,0 +1,4 @@
+interface:
+  display_name: "Merge LLM Outputs"
+  short_description: "Synthesize stronger answers from two LLM outputs."
+  default_prompt: "Use $merge-llm-outputs to mine an alternative LLM output for missed insights, verify disagreements, and deliver a revised synthesis."

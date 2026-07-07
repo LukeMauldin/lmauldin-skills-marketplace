@@ -1,0 +1,4 @@
+interface:
+  display_name: "Simplify Review Cleanup"
+  short_description: "Review diffs for reuse, quality, and efficiency"
+  default_prompt: "Use $simplify-code-review-cleanup to review the current changes, run the three parallel review passes, and apply any worthwhile cleanup fixes."

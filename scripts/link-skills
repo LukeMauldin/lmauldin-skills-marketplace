@@ -1,0 +1,99 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+repo_dir="${0:A:h:h}"
+skills_dir="$repo_dir/skills"
+dry_run=0
+if [ "${1:-}" = "--dry-run" ]; then
+  dry_run=1
+fi
+
+timestamp="$(date +%Y%m%d-%H%M%S)"
+backup_root="$HOME/.codex/skill-backups/$timestamp"
+
+roots=(
+  "$HOME/.claude/skills"
+  "$HOME/.qwen/skills"
+  "$HOME/.pi/agent/skills"
+  "$HOME/.cursor-homes/jb/.cursor/skills"
+  "$HOME/.cursor-homes/ks/.cursor/skills"
+)
+
+codex_roots=(
+  "$HOME/.codex/skills"
+  "$HOME/.config/opencode/skills"
+)
+
+canonical_names=("${(@f)$(find "$skills_dir" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | sort)}")
+
+run() {
+  if [ "$dry_run" -eq 1 ]; then
+    printf 'DRY %q ' "$@"
+    printf '\n'
+  else
+    "$@"
+  fi
+}
+
+backup_path() {
+  local item="$1"
+  local rel="${item#$HOME/}"
+  local dest="$backup_root/$rel"
+  run mkdir -p "${dest:h}"
+  run mv "$item" "$dest"
+}
+
+link_root_skill() {
+  local root="$1"
+  local name="$2"
+  local target="$root/$name"
+  local source="$skills_dir/$name"
+  run mkdir -p "$root"
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    if [ -L "$target" ] && [ "$(readlink "$target")" = "$source" ]; then
+      return
+    fi
+    backup_path "$target"
+  fi
+  run ln -s "$source" "$target"
+}
+
+remove_root_skill() {
+  local root="$1"
+  local name="$2"
+  local target="$root/$name"
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    backup_path "$target"
+  fi
+}
+
+# Make ~/.agents/skills the shared facade.
+agents_root="$HOME/.agents/skills"
+if [ -e "$agents_root" ] || [ -L "$agents_root" ]; then
+  if [ ! -L "$agents_root" ] || [ "$(readlink "$agents_root")" != "$skills_dir" ]; then
+    backup_path "$agents_root"
+    run ln -s "$skills_dir" "$agents_root"
+  fi
+else
+  run mkdir -p "$HOME/.agents"
+  run ln -s "$skills_dir" "$agents_root"
+fi
+
+# Agents that need their own skill root get per-skill symlinks. Their .system dirs are left alone.
+for root in "${roots[@]}"; do
+  for name in "${canonical_names[@]}"; do
+    link_root_skill "$root" "$name"
+  done
+  if [ -f "$root/SKILL.md" ]; then
+    backup_path "$root/SKILL.md"
+  fi
+done
+
+# Codex and OpenCode can read ~/.agents/skills; remove duplicated non-system skill dirs from their own roots.
+for root in "${codex_roots[@]}"; do
+  for name in "${canonical_names[@]}"; do
+    remove_root_skill "$root" "$name"
+  done
+done
+
+printf 'backup_root=%s\n' "$backup_root"

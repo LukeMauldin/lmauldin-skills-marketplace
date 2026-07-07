@@ -1,0 +1,4 @@
+interface:
+  display_name: "Simple PR Review"
+  short_description: "Concise GitHub PR review workflow"
+  default_prompt: "Use $review-simple to review GitHub pull request 123 with concise findings and risks."

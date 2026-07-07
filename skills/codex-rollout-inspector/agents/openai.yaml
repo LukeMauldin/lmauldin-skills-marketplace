@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Rollout Inspector"
+  short_description: "Locate and inspect Codex rollout logs"
+  default_prompt: "Use $codex-rollout-inspector to locate, read, and summarize Codex session rollout logs on this machine."

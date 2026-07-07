@@ -1,0 +1,7 @@
+interface:
+  display_name: "Plan Refinement"
+  short_description: "Critique and tighten draft plans."
+  default_prompt: "Use $plan-refinement to audit these draft plans against the source-of-truth docs, discard wrong assumptions, and produce one tighter implementation-ready plan."
+
+policy:
+  allow_implicit_invocation: false

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Implementation Judge Prompt"
+  short_description: "Create judge prompts for parallel agent outputs"
+  default_prompt: "Use $judge-agent-implementations to craft a rubric-based LLM judge prompt that compares parallel agent implementations, chooses a winner, and outputs prioritized improvements."

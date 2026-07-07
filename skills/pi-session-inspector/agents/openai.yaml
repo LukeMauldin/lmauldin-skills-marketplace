@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pi Session Inspector"
+  short_description: "Locate and inspect pi-coding-agent session logs"
+  default_prompt: "Use $pi-session-inspector to locate, read, and summarize pi-coding-agent session logs on this machine."

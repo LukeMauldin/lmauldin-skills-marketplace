@@ -38,6 +38,8 @@ hash_skill() {
 
 default_names=("${(@f)$(cat "$repo_dir/manifests/default-linked.txt")}")
 optional_names=("${(@f)$(cat "$repo_dir/manifests/optional.txt")}")
+removed_names=("${(@f)$(cat "$repo_dir/manifests/removed.txt")}")
+errors=0
 
 for root in "${linked_roots[@]}"; do
   printf '\n# %s\n' "$root"
@@ -51,6 +53,7 @@ for root in "${linked_roots[@]}"; do
     canonical="$skills_dir/$name"
     if [ ! -e "$target" ]; then
       printf 'missing %s\n' "$name"
+      errors=$((errors + 1))
       continue
     fi
     if [ -L "$target" ]; then
@@ -66,11 +69,19 @@ for root in "${linked_roots[@]}"; do
       printf 'same %s\n' "$name"
     else
       printf 'drift %s\n' "$name"
+      errors=$((errors + 1))
     fi
   done
   for name in "${optional_names[@]}"; do
     if [ -e "$root/$name" ] || [ -L "$root/$name" ]; then
       printf 'optional_present %s\n' "$name"
+      errors=$((errors + 1))
+    fi
+  done
+  for name in "${removed_names[@]}"; do
+    if [ -e "$root/$name" ] || [ -L "$root/$name" ]; then
+      printf 'removed_present %s\n' "$name"
+      errors=$((errors + 1))
     fi
   done
 done
@@ -84,6 +95,20 @@ for root in "${dedup_roots[@]}"; do
   for name in "${default_names[@]}" "${optional_names[@]}"; do
     if [ -e "$root/$name" ] || [ -L "$root/$name" ]; then
       printf 'duplicate_present %s\n' "$name"
+      errors=$((errors + 1))
+    fi
+  done
+  for name in "${removed_names[@]}"; do
+    if [ -e "$root/$name" ] || [ -L "$root/$name" ]; then
+      printf 'removed_present %s\n' "$name"
+      errors=$((errors + 1))
     fi
   done
 done
+
+if [ "$errors" -gt 0 ]; then
+  printf '\naudit_errors=%s\n' "$errors"
+  exit 1
+fi
+
+printf '\naudit_errors=0\n'

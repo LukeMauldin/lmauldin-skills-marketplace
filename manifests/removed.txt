@@ -1,0 +1,14 @@
+ask-questions-if-underspecified
+caveman
+copilot-session-inspector
+diagnose
+linear-team-setup
+lsp-setup
+macos-memory-pressure
+sentry-cli
+setup-matt-pocock-skills
+tavily-extract
+tavily-research
+write-a-skill
+writing-great-skills
+zoom-out

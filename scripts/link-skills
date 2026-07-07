@@ -26,6 +26,7 @@ codex_roots=(
 
 default_names=("${(@f)$(cat "$repo_dir/manifests/default-linked.txt")}")
 optional_names=("${(@f)$(cat "$repo_dir/manifests/optional.txt")}")
+removed_names=("${(@f)$(cat "$repo_dir/manifests/removed.txt")}")
 
 run() {
   if [ "$dry_run" -eq 1 ]; then
@@ -88,6 +89,9 @@ for root in "$agents_root" "${roots[@]}"; do
   for name in "${optional_names[@]}"; do
     remove_root_skill "$root" "$name"
   done
+  for name in "${removed_names[@]}"; do
+    remove_root_skill "$root" "$name"
+  done
   if [ -f "$root/SKILL.md" ]; then
     backup_path "$root/SKILL.md"
   fi
@@ -95,7 +99,7 @@ done
 
 # Codex and OpenCode can read ~/.agents/skills; remove duplicated non-system skill dirs from their own roots.
 for root in "${codex_roots[@]}"; do
-  for name in "${default_names[@]}" "${optional_names[@]}"; do
+  for name in "${default_names[@]}" "${optional_names[@]}" "${removed_names[@]}"; do
     remove_root_skill "$root" "$name"
   done
 done

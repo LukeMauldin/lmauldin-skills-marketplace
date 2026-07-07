@@ -53,7 +53,8 @@ Apply in order.
    rebase/restack, abandon, undo). Read-only `git log`/`diff`/`status` and `gh`
    for PRs/CI stay fine. The undo safety net only covers changes jj made.
 4. **Single-branch PR or follow-up commit** → Workflows A/B below.
-5. **Stack of dependent PRs** → Workflow C; restack onto advanced main → Workflow D.
+5. **Stack of dependent PRs** → Workflow C; restack onto advanced main → Workflow D;
+   whole stack squash-merged, fetch left conflicts/twins → Workflow D2.
 6. **Local state disagrees with the open PR** (divergent bookmark, empty `@`, WC
    drift) → Workflow E.
 7. **Recovering from a bad operation** (wrong rebase/reset/squash/abandon, by you
@@ -221,6 +222,16 @@ Because jj tracks changes by change ID and can drop emptied commits, there are
 **no duplicate-history conflict piles**; your not-yet-merged base commits replant
 cleanly on top of the new main, and once they later merge `--skip-emptied` drops them.
 
+> **Squash-merge caveat (the common case).** GitHub squash-merge collapses each PR
+> into one commit with a *new* change ID, so jj cannot match your local incremental
+> commits by lineage. `--skip-emptied` therefore does **not** drop them; they replant
+> onto the new `main` with **spurious per-commit conflicts** against content `main`
+> already contains (you will see `New conflicts appeared in N commits` and possibly
+> `(divergent)` twins on the next `jj git fetch`). This is still far better than
+> git's one giant duplicate-history pile, but it is **not** conflict-free. Do **not**
+> `jj resolve` these — the work is already merged. When the *whole* stack has merged,
+> see Workflow D2.
+
 > **Do NOT merge main into your branch to "catch up"** (`jj new @ main@origin` /
 > `git merge main`). It looks clean and conflict-free, but it buries a 2-parent merge
 > commit *inside* your stack — which then forces a painful manual linearization later
@@ -249,6 +260,51 @@ If `--skip-emptied` leaves a now-redundant change (content differed slightly fro
 the squash), abandon it explicitly: `jj abandon <change-id>` (descendants rebase
 to its parent automatically). Verified: when T1's content matches the squash
 commit, `--skip-emptied` drops it automatically with no leftover.
+
+## Workflow D2 — recover after your whole stack squash-merged
+
+Use when **every** PR in your stack has merged and `jj git fetch` left a mess:
+*"Abandoned N commits" + "New conflicts appeared in N commits" + `(divergent)`
+twins*, and the bookmarks it deleted map to PRs that are all merged. Per the
+squash-merge caveat above, those conflicts are **spurious** — the content is
+already in `main`. Do not `jj resolve` them; abandon the orphans instead.
+
+1. **Confirm the PRs merged** — `gh pr list --state merged`. The fetch abandons by
+   *reachability* (the deleted bookmarks), **not** by verifying content landed, so
+   "the bookmark is gone" alone does not prove the work is in `main`.
+2. **Gate before abandoning — verify content is actually in `main`.** A commit made
+   locally *after* the last push to its PR never entered the squash. `jj new 'trunk()'`
+   first (step 3), then spot-check one **substantive, non-docs** commit per surviving
+   branch: confirm its files/symbols exist in the working tree (now = `main`). If yes,
+   abandon is safe; if a source line is missing, that branch has unpushed work — keep it.
+   Docs-only commits are low-signal; do not gate on them.
+3. **Get a clean working copy now (non-destructive):**
+   ```bash
+   jj new 'trunk()'                              # empty @ on the new main; resume work here
+   ```
+4. **Preview the abandon set before running it.** Target by reachability from the
+   merged heads' **commit SHAs** (change IDs are ambiguous under divergence, and the
+   deleted bookmark names are conflicted `??` — neither works in a revset), bounded
+   away from `main` and `@`, and confirm it touches *only* the merged stack:
+   ```bash
+   SET='(::(sha1|sha2|sha3|…)) ~ ::main@origin ~ ::@'
+   jj --no-pager log -r "$SET" --no-graph -T '"x\n"' | wc -l          # sanity: expected count
+   jj --no-pager log -r "$SET & bookmarks()"                          # MUST list only merged-stack bookmarks
+   jj --no-pager log -r "$SET & (<keep-bookmark-1> | <keep-bookmark-2>)"  # MUST be empty — no leak
+   jj abandon -r "$SET"                                               # deletes the orphans + their stale bookmarks
+   ```
+5. **Confirm clean:** `jj --no-pager log -r 'conflicts() | divergent()'` returns
+   nothing. A lone straggler conflict head can survive if its SHA was not in the set —
+   verify its content is in `main`, then `jj abandon <sha>` it too.
+
+Reversible throughout: `jj op restore <op-id-before-the-abandon>` (find it in
+`jj --no-pager op log`). Nothing here pushes, so it stays local until you choose to.
+
+**Root cause to avoid next time:** pre-emptively rebasing the stack (`jj rebase -s …
+--onto 'trunk()'`) *while sibling PRs are still merging* seeds the `(divergent)` twins
+that the next fetch then re-rebases. On a stack that is squash-merging, prefer to just
+`jj git fetch`, let it abandon what it can, then run this workflow — rather than
+rebasing repeatedly mid-merge.
 
 ## Workflow E — realign local state with the PR tip
 

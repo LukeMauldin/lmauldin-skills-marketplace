@@ -254,6 +254,22 @@ jj --no-pager log -r 'change_id(<id>)' --no-graph \
 are already hidden. No revisions to abandon.` — that is a benign no-op, **not** an
 error; do not retry or escalate.
 
+### Cleaning up many divergent/orphan commits at once (whole stack merged)
+
+When a squash-merged stack leaves a *field* of orphaned commits — some `(divergent)`,
+some `(conflict)` — do not resolve them one by one. Build one abandon revset by
+reachability from the orphan heads and preview it first (full procedure: Workflow D2).
+Two gotchas specific to this bulk case:
+
+- **Reference every head by commit SHA, not change ID or bookmark name.** Change IDs
+  are ambiguous under divergence (above). The bookmarks the fetch deleted are left in a
+  conflicted state and render as `name??`; using such a name in a revset fails with
+  `Name … is conflicted` — use the SHA, or `bookmarks(exact:"<name>")` if you must name it.
+- **Prove the set is bounded before abandoning.** `jj --no-pager log -r "$SET & bookmarks()"`
+  must list only the merged-stack bookmarks, and an intersection against your keep-bookmarks
+  must be empty. `jj abandon -r "$SET"` deletes the orphans *and* their stale bookmarks in
+  one op; `jj bookmark forget` afterward then reports "No bookmarks to forget" (expected).
+
 ## Colocated gotchas
 
 - **Detached HEAD in git is normal.** jj keeps git HEAD detached. Do not use

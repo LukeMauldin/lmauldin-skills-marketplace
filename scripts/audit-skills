@@ -15,6 +15,9 @@ linked_roots=(
 
 dedup_roots=(
   "$HOME/.codex/skills"
+)
+
+facade_roots=(
   "$HOME/.config/opencode/skills"
 )
 
@@ -84,6 +87,28 @@ for root in "${linked_roots[@]}"; do
       errors=$((errors + 1))
     fi
   done
+done
+
+agents_root="$HOME/.agents/skills"
+for root in "${facade_roots[@]}"; do
+  printf '\n# %s\n' "$root"
+  if [ ! -e "$root" ] && [ ! -L "$root" ]; then
+    printf 'missing_facade\n'
+    errors=$((errors + 1))
+    continue
+  fi
+  if [ ! -L "$root" ]; then
+    printf 'facade_not_symlink\n'
+    errors=$((errors + 1))
+    continue
+  fi
+  resolved="$(readlink "$root")"
+  if [ "$resolved" = "$agents_root" ]; then
+    printf 'facade_linked -> %s\n' "$resolved"
+  else
+    printf 'unexpected_facade_link -> %s\n' "$resolved"
+    errors=$((errors + 1))
+  fi
 done
 
 for root in "${dedup_roots[@]}"; do

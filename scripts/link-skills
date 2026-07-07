@@ -21,6 +21,9 @@ roots=(
 
 codex_roots=(
   "$HOME/.codex/skills"
+)
+
+facade_roots=(
   "$HOME/.config/opencode/skills"
 )
 
@@ -69,6 +72,18 @@ remove_root_skill() {
   fi
 }
 
+link_skill_facade() {
+  local root="$1"
+  run mkdir -p "${root:h}"
+  if [ -e "$root" ] || [ -L "$root" ]; then
+    if [ -L "$root" ] && [ "$(readlink "$root")" = "$agents_root" ]; then
+      return
+    fi
+    backup_path "$root"
+  fi
+  run ln -s "$agents_root" "$root"
+}
+
 # Make ~/.agents/skills the shared facade with default-linked skills only.
 agents_root="$HOME/.agents/skills"
 if [ -e "$agents_root" ] || [ -L "$agents_root" ]; then
@@ -97,7 +112,11 @@ for root in "$agents_root" "${roots[@]}"; do
   fi
 done
 
-# Codex and OpenCode can read ~/.agents/skills; remove duplicated non-system skill dirs from their own roots.
+for root in "${facade_roots[@]}"; do
+  link_skill_facade "$root"
+done
+
+# Codex can read ~/.agents/skills; remove duplicated non-system skill dirs from its own root.
 for root in "${codex_roots[@]}"; do
   for name in "${default_names[@]}" "${optional_names[@]}" "${removed_names[@]}"; do
     remove_root_skill "$root" "$name"

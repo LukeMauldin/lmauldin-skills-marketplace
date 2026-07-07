@@ -1,0 +1,70 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+repo_dir="${0:A:h:h}"
+
+agent_files=(
+  "harnesses/codex/AGENTS.md:$HOME/.codex/AGENTS.md"
+  "harnesses/claude/CLAUDE.md:$HOME/.claude/CLAUDE.md"
+  "harnesses/pi/AGENTS.md:$HOME/.pi/agent/AGENTS.md"
+  "harnesses/opencode/AGENTS.md:$HOME/.config/opencode/AGENTS.md"
+  "harnesses/qwen/AGENTS.md:$HOME/.qwen/AGENTS.md"
+)
+
+hash_file() {
+  local file="$1"
+  shasum -a 256 "$file" | awk '{print $1}'
+}
+
+errors=0
+
+for entry in "${agent_files[@]}"; do
+  source_rel="${entry%%:*}"
+  target="${entry#*:}"
+  source="$repo_dir/$source_rel"
+
+  printf '\n# %s\n' "$target"
+
+  if [ ! -f "$source" ]; then
+    printf 'missing_source %s\n' "$source_rel"
+    errors=$((errors + 1))
+    continue
+  fi
+
+  if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+    printf 'missing_target\n'
+    errors=$((errors + 1))
+    continue
+  fi
+
+  if [ -L "$target" ]; then
+    resolved="$(readlink "$target")"
+    if [ "$resolved" = "$source" ]; then
+      printf 'linked -> %s\n' "$resolved"
+    else
+      printf 'unexpected_link -> %s\n' "$resolved"
+      errors=$((errors + 1))
+    fi
+    continue
+  fi
+
+  if [ -d "$target" ]; then
+    printf 'target_is_directory\n'
+    errors=$((errors + 1))
+    continue
+  fi
+
+  if [ "$(hash_file "$target")" = "$(hash_file "$source")" ]; then
+    printf 'same\n'
+  else
+    printf 'drift\n'
+    errors=$((errors + 1))
+  fi
+done
+
+if [ "$errors" -gt 0 ]; then
+  printf '\naudit_errors=%s\n' "$errors"
+  exit 1
+fi
+
+printf '\naudit_errors=0\n'

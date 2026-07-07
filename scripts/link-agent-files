@@ -1,0 +1,76 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+repo_dir="${0:A:h:h}"
+dry_run=0
+
+if [ "${1:-}" = "--dry-run" ]; then
+  dry_run=1
+elif [ "${1:-}" != "" ]; then
+  printf 'usage: %s [--dry-run]\n' "$0" >&2
+  exit 2
+fi
+
+timestamp="$(date +%Y%m%d-%H%M%S)"
+backup_root="$HOME/.codex/agent-file-backups/$timestamp"
+
+agent_files=(
+  "harnesses/codex/AGENTS.md:$HOME/.codex/AGENTS.md"
+  "harnesses/claude/CLAUDE.md:$HOME/.claude/CLAUDE.md"
+  "harnesses/pi/AGENTS.md:$HOME/.pi/agent/AGENTS.md"
+  "harnesses/opencode/AGENTS.md:$HOME/.config/opencode/AGENTS.md"
+  "harnesses/qwen/AGENTS.md:$HOME/.qwen/AGENTS.md"
+)
+
+run() {
+  if [ "$dry_run" -eq 1 ]; then
+    printf 'DRY %q ' "$@"
+    printf '\n'
+  else
+    "$@"
+  fi
+}
+
+backup_path() {
+  local item="$1"
+  local rel="${item#$HOME/}"
+  local dest="$backup_root/$rel"
+  run mkdir -p "${dest:h}"
+  run mv "$item" "$dest"
+}
+
+link_agent_file() {
+  local source_rel="$1"
+  local target="$2"
+  local source="$repo_dir/$source_rel"
+
+  if [ ! -f "$source" ]; then
+    printf 'missing_source %s\n' "$source_rel" >&2
+    return 1
+  fi
+
+  run mkdir -p "${target:h}"
+
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    if [ -L "$target" ] && [ "$(readlink "$target")" = "$source" ]; then
+      printf 'already_linked %s\n' "$target"
+      return 0
+    fi
+    if [ -d "$target" ] && [ ! -L "$target" ]; then
+      printf 'refusing_directory_target %s\n' "$target" >&2
+      return 1
+    fi
+    backup_path "$target"
+  fi
+
+  run ln -s "$source" "$target"
+  printf 'linked %s -> %s\n' "$target" "$source"
+}
+
+for entry in "${agent_files[@]}"; do
+  source_rel="${entry%%:*}"
+  target="${entry#*:}"
+  link_agent_file "$source_rel" "$target"
+done
+
+printf 'backup_root=%s\n' "$backup_root"

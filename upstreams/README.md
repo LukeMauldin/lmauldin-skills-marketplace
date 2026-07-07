@@ -24,6 +24,10 @@ This repo is a curated mirror, not the original authoring location for every ski
 - `linear-team-setup`
 - `tavily-extract`
 - `tavily-research`
+- `ask-questions-if-underspecified`
+- `macos-memory-pressure`
+- `setup-matt-pocock-skills`
+- `writing-great-skills`
 - Copilot-only skills
 
 ## Manual Local Choices

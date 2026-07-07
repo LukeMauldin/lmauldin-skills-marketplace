@@ -4,15 +4,18 @@ set -euo pipefail
 repo_dir="${0:A:h:h}"
 skills_dir="$repo_dir/skills"
 
-roots=(
+linked_roots=(
   "$HOME/.agents/skills"
   "$HOME/.claude/skills"
-  "$HOME/.codex/skills"
   "$HOME/.qwen/skills"
   "$HOME/.pi/agent/skills"
-  "$HOME/.config/opencode/skills"
   "$HOME/.cursor-homes/jb/.cursor/skills"
   "$HOME/.cursor-homes/ks/.cursor/skills"
+)
+
+dedup_roots=(
+  "$HOME/.codex/skills"
+  "$HOME/.config/opencode/skills"
 )
 
 hash_skill() {
@@ -33,16 +36,17 @@ hash_skill() {
   )
 }
 
-canonical_names=("${(@f)$(find "$skills_dir" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | sort)}")
+default_names=("${(@f)$(cat "$repo_dir/manifests/default-linked.txt")}")
+optional_names=("${(@f)$(cat "$repo_dir/manifests/optional.txt")}")
 
-for root in "${roots[@]}"; do
+for root in "${linked_roots[@]}"; do
   printf '\n# %s\n' "$root"
   if [ ! -d "$root" ]; then
     printf 'missing root\n'
     continue
   fi
 
-  for name in "${canonical_names[@]}"; do
+  for name in "${default_names[@]}"; do
     target="$root/$name"
     canonical="$skills_dir/$name"
     if [ ! -e "$target" ]; then
@@ -62,6 +66,24 @@ for root in "${roots[@]}"; do
       printf 'same %s\n' "$name"
     else
       printf 'drift %s\n' "$name"
+    fi
+  done
+  for name in "${optional_names[@]}"; do
+    if [ -e "$root/$name" ] || [ -L "$root/$name" ]; then
+      printf 'optional_present %s\n' "$name"
+    fi
+  done
+done
+
+for root in "${dedup_roots[@]}"; do
+  printf '\n# %s\n' "$root"
+  if [ ! -d "$root" ]; then
+    printf 'missing root\n'
+    continue
+  fi
+  for name in "${default_names[@]}" "${optional_names[@]}"; do
+    if [ -e "$root/$name" ] || [ -L "$root/$name" ]; then
+      printf 'duplicate_present %s\n' "$name"
     fi
   done
 done

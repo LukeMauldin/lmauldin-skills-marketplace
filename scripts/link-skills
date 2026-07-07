@@ -24,7 +24,8 @@ codex_roots=(
   "$HOME/.config/opencode/skills"
 )
 
-canonical_names=("${(@f)$(find "$skills_dir" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | sort)}")
+default_names=("${(@f)$(cat "$repo_dir/manifests/default-linked.txt")}")
+optional_names=("${(@f)$(cat "$repo_dir/manifests/optional.txt")}")
 
 run() {
   if [ "$dry_run" -eq 1 ]; then
@@ -67,22 +68,25 @@ remove_root_skill() {
   fi
 }
 
-# Make ~/.agents/skills the shared facade.
+# Make ~/.agents/skills the shared facade with default-linked skills only.
 agents_root="$HOME/.agents/skills"
 if [ -e "$agents_root" ] || [ -L "$agents_root" ]; then
-  if [ ! -L "$agents_root" ] || [ "$(readlink "$agents_root")" != "$skills_dir" ]; then
+  if [ -L "$agents_root" ]; then
     backup_path "$agents_root"
-    run ln -s "$skills_dir" "$agents_root"
   fi
-else
+fi
+if [ ! -e "$agents_root" ]; then
   run mkdir -p "$HOME/.agents"
-  run ln -s "$skills_dir" "$agents_root"
+  run mkdir -p "$agents_root"
 fi
 
 # Agents that need their own skill root get per-skill symlinks. Their .system dirs are left alone.
-for root in "${roots[@]}"; do
-  for name in "${canonical_names[@]}"; do
+for root in "$agents_root" "${roots[@]}"; do
+  for name in "${default_names[@]}"; do
     link_root_skill "$root" "$name"
+  done
+  for name in "${optional_names[@]}"; do
+    remove_root_skill "$root" "$name"
   done
   if [ -f "$root/SKILL.md" ]; then
     backup_path "$root/SKILL.md"
@@ -91,7 +95,7 @@ done
 
 # Codex and OpenCode can read ~/.agents/skills; remove duplicated non-system skill dirs from their own roots.
 for root in "${codex_roots[@]}"; do
-  for name in "${canonical_names[@]}"; do
+  for name in "${default_names[@]}" "${optional_names[@]}"; do
     remove_root_skill "$root" "$name"
   done
 done

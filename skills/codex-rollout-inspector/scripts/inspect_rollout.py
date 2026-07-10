@@ -14,15 +14,17 @@ import re
 import shlex
 import sys
 import tomllib
+from compression import zstd
 from collections import Counter
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 ROLLOUT_RE = re.compile(
-    r"^rollout-(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})-(?P<thread_id>[^/]+)\.jsonl$"
+    r"^rollout-(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})-"
+    r"(?P<thread_id>[^/]+)\.jsonl(?:\.zst)?$"
 )
 THREAD_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
@@ -41,6 +43,7 @@ WEB_SEARCH_CALL_TYPE = "web_search_call"
 IMAGE_GENERATION_CALL_TYPE = "image_generation_call"
 SCRIPT_DIR = Path(__file__).resolve().parent
 _QUICK_CACHE_BY_KEY: dict[tuple[str, str, str, int, int], "QuickRolloutCache"] = {}
+_TREE_CACHE_BY_KEY: dict[tuple[str, str], "RolloutTreeCache"] = {}
 
 
 def _load_support_module(module_name: str, filename: str) -> Any:
@@ -141,6 +144,62 @@ class QuickRollout:
                 self.forked_from_id,
             )
         )
+
+
+@dataclass(slots=True)
+class RolloutTreeInfo:
+    path: Path
+    thread_id: str
+    parent_thread_id: str | None
+
+
+class RolloutTreeCache:
+    """Metadata-only index for rollout ancestry and child discovery."""
+
+    def __init__(self, paths: "RolloutPaths") -> None:
+        self._paths = paths
+        self._by_path: dict[str, RolloutTreeInfo] = {}
+        self._by_thread_id: dict[str, list[RolloutTreeInfo]] = {}
+        self._children_by_parent_id: dict[str, list[RolloutTreeInfo]] = {}
+        self._populated = False
+
+    def _remember(self, info: RolloutTreeInfo) -> None:
+        key = str(info.path)
+        if key in self._by_path:
+            return
+        self._by_path[key] = info
+        self._by_thread_id.setdefault(info.thread_id, []).append(info)
+        if info.parent_thread_id:
+            self._children_by_parent_id.setdefault(info.parent_thread_id, []).append(info)
+
+    def _ensure_populated(self) -> None:
+        if self._populated:
+            return
+        for archived_mode in (False, True):
+            for path in collect_rollouts(self._paths, archived=archived_mode, since=None):
+                self._remember(quick_rollout_tree_info(path))
+        for children in self._children_by_parent_id.values():
+            children.sort(key=lambda item: item.path.name)
+        self._populated = True
+
+    def get_info(self, path: Path) -> RolloutTreeInfo:
+        cached = self._by_path.get(str(path))
+        if cached is not None:
+            return cached
+        info = quick_rollout_tree_info(path)
+        self._remember(info)
+        return info
+
+    def resolve_thread_id(self, thread_id: str) -> Path:
+        self._ensure_populated()
+        matches = self._by_thread_id.get(thread_id)
+        if not matches:
+            raise FileNotFoundError(f"could not resolve rollout target: {thread_id}")
+        return matches[-1].path
+
+    def children_for_parent(self, parent_thread_id: str) -> list[Path]:
+        self._ensure_populated()
+        return [info.path for info in self._children_by_parent_id.get(parent_thread_id, ())]
 
 
 class QuickRolloutCache:
@@ -252,6 +311,15 @@ def get_quick_rollout_cache(
     if cache is None:
         cache = QuickRolloutCache(paths, thread_names)
         _QUICK_CACHE_BY_KEY[key] = cache
+    return cache
+
+
+def get_rollout_tree_cache(paths: RolloutPaths) -> RolloutTreeCache:
+    key = (str(paths.sessions_dir), str(paths.archived_sessions_dir))
+    cache = _TREE_CACHE_BY_KEY.get(key)
+    if cache is None:
+        cache = RolloutTreeCache(paths)
+        _TREE_CACHE_BY_KEY[key] = cache
     return cache
 
 
@@ -863,9 +931,15 @@ def latest_rollout(root: Path) -> Path | None:
 def collect_rollouts_in_root(root: Path) -> list[Path]:
     if not root.exists():
         return []
-    glob_pattern = "*.jsonl" if root.name == "archived_sessions" else "*/*/*/rollout-*.jsonl"
-    paths = sorted(root.glob(glob_pattern))
-    return [path for path in paths if path.is_file() and ROLLOUT_RE.match(path.name)]
+    by_plain_name: dict[str, Path] = {}
+    for path in root.rglob("rollout-*.jsonl*"):
+        if not path.is_file() or not ROLLOUT_RE.match(path.name):
+            continue
+        plain_name = path.name.removesuffix(".zst")
+        current = by_plain_name.get(plain_name)
+        if current is None or (current.suffix == ".zst" and path.suffix != ".zst"):
+            by_plain_name[plain_name] = path
+    return [by_plain_name[name] for name in sorted(by_plain_name)]
 
 
 def collect_rollouts(
@@ -906,6 +980,38 @@ def rollout_date(path: Path) -> date | None:
     return date.fromisoformat(match.group("ts")[0:10])
 
 
+def quick_rollout_tree_info(path: Path) -> RolloutTreeInfo:
+    """Read only the session metadata needed to relate rollout files."""
+    match = ROLLOUT_RE.match(path.name)
+    if not match:
+        raise ValueError(f"not a rollout file: {path}")
+
+    parent_thread_id: str | None = None
+    with open_rollout_text(path) as handle:
+        for raw in handle:
+            if not raw.strip():
+                continue
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict) or obj.get("type") != "session_meta":
+                continue
+            payload = obj.get("payload")
+            if isinstance(payload, dict):
+                thread_spawn = extract_thread_spawn(payload.get("source"))
+                parent_thread_id = string_or_none(
+                    thread_spawn.get("parent_thread_id") if thread_spawn else None
+                ) or string_or_none(payload.get("forked_from_id"))
+            break
+
+    return RolloutTreeInfo(
+        path=path,
+        thread_id=match.group("thread_id"),
+        parent_thread_id=parent_thread_id,
+    )
+
+
 def quick_rollout_info(path: Path, thread_names: dict[str, str]) -> QuickRollout:
     match = ROLLOUT_RE.match(path.name)
     if not match:
@@ -917,7 +1023,7 @@ def quick_rollout_info(path: Path, thread_names: dict[str, str]) -> QuickRollout
     first_event_user_message: str | None = None
     first_response_user_message: str | None = None
 
-    with path.open(encoding="utf-8") as handle:
+    with open_rollout_text(path) as handle:
         for raw in handle:
             if not raw.strip():
                 continue
@@ -1038,19 +1144,26 @@ def resolve_target(
 def load_rollout(path: Path) -> LoadedRollout:
     records: list[dict[str, Any]] = []
     parse_errors = 0
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        if not raw.strip():
-            continue
-        try:
-            obj = json.loads(raw)
-        except json.JSONDecodeError:
-            parse_errors += 1
-            continue
-        if isinstance(obj, dict):
-            records.append(obj)
-        else:
-            parse_errors += 1
+    with open_rollout_text(path) as handle:
+        for raw in handle:
+            if not raw.strip():
+                continue
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                parse_errors += 1
+                continue
+            if isinstance(obj, dict):
+                records.append(obj)
+            else:
+                parse_errors += 1
     return LoadedRollout(path=path, records=records, parse_errors=parse_errors)
+
+
+def open_rollout_text(path: Path) -> TextIO:
+    if path.name.endswith(".jsonl.zst"):
+        return zstd.open(path, mode="rt", encoding="utf-8")
+    return path.open(mode="rt", encoding="utf-8")
 
 
 def summarize_rollout(
@@ -1316,7 +1429,11 @@ def build_ingestion_summary(
                 "mode": "cumulative_snapshot",
                 "input": nested_int(token_usage, "latest_total_token_usage", "input_tokens"),
                 "output": nested_int(token_usage, "latest_total_token_usage", "output_tokens"),
-                "cache_create": None,
+                "cache_create": nested_int(
+                    token_usage,
+                    "latest_total_token_usage",
+                    "cache_write_tokens",
+                ),
                 "cache_read": nested_int(token_usage, "latest_total_token_usage", "cached_input_tokens"),
                 "reasoning_output": nested_int(
                     token_usage,
@@ -1414,7 +1531,14 @@ def summarize_token_usage(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     latest_last_token_usage: dict[str, Any] | None = None
     latest_rate_limits: dict[str, Any] | None = None
     latest_model_context_window: int | None = None
-    previous_signature: tuple[int | None, int | None, int | None, int | None, int | None] | None = None
+    previous_signature: tuple[
+        int | None,
+        int | None,
+        int | None,
+        int | None,
+        int | None,
+        int | None,
+    ] | None = None
 
     for obj in records:
         if obj.get("type") != "event_msg":
@@ -1440,6 +1564,7 @@ def summarize_token_usage(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
         signature = (
             int_or_none(total_token_usage.get("input_tokens")),
             int_or_none(total_token_usage.get("cached_input_tokens")),
+            int_or_none(total_token_usage.get("cache_write_tokens")),
             int_or_none(total_token_usage.get("output_tokens")),
             int_or_none(total_token_usage.get("reasoning_output_tokens")),
             int_or_none(total_token_usage.get("total_tokens")),
@@ -1627,9 +1752,9 @@ def list_child_rollouts(
     paths: RolloutPaths,
     thread_names: dict[str, str],
 ) -> list[QuickRollout]:
-    cache = get_quick_rollout_cache(paths, thread_names)
-    parent = cache.get_quick_info(parent_path)
-    return cache.children_for_parent(parent.thread_id)
+    cache = get_rollout_tree_cache(paths)
+    parent = cache.get_info(parent_path)
+    return [quick_rollout_info(path, thread_names) for path in cache.children_for_parent(parent.thread_id)]
 
 
 def extract_pr_links(records: Iterable[dict[str, Any]]) -> list[str]:

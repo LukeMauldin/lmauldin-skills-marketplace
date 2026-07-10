@@ -8,6 +8,7 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -133,6 +134,55 @@ class CodexImporterTests(unittest.TestCase):
         self.assertEqual(second["skipped"], 1)
         self.assertEqual(third["imported"], 1)
 
+    def test_exact_path_refresh_does_not_build_full_quick_summary_cache(self) -> None:
+        self.write_rollouts(include_child=False)
+        parser = importer._load_parser()
+
+        with patch.object(
+            parser,
+            "get_quick_rollout_cache",
+            side_effect=AssertionError("exact-path refresh built the full summary cache"),
+        ):
+            result = importer.refresh_rollouts(
+                self.codex_home,
+                target=str(self.rollout_path),
+                reconcile=False,
+                analyze=False,
+            )
+
+        self.assertEqual(result["imported"], 1)
+
+    def test_reconcile_falls_back_to_session_id_after_rollout_is_archived(self) -> None:
+        self.write_rollouts(include_child=False)
+        archived_path = self.codex_home / "archived_sessions" / self.rollout_path.name
+        archived_path.parent.mkdir(parents=True)
+        self.rollout_path.rename(archived_path)
+        db.write_pending_marker(
+            importer.resolve_db_path(self.codex_home),
+            THREAD_ID,
+            {
+                "session_id": THREAD_ID,
+                "target": str(self.rollout_path),
+                "marker_kind": "reconcile",
+                "reason": "post_stop_final_flush",
+                "retryable": True,
+            },
+        )
+
+        reconciled = importer.reconcile_pending(self.codex_home)
+
+        self.assertEqual(reconciled, [THREAD_ID])
+        db_path = importer.resolve_db_path(self.codex_home)
+        self.assertEqual(list(db.pending_dir(db_path).glob("*.json")), [])
+        with closing(db.open_db(db_path)) as conn:
+            row = conn.execute(
+                "SELECT file_path, archived FROM sessions WHERE session_id = ?",
+                (THREAD_ID,),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["file_path"], str(archived_path))
+        self.assertEqual(row["archived"], 1)
+
     def test_user_messages_extracted(self) -> None:
         self.write_rollouts(include_child=False)
 
@@ -211,7 +261,7 @@ class CodexImporterTests(unittest.TestCase):
             ).fetchone()
             turn_row = conn.execute(
                 """
-                SELECT input_tokens, cached_input_tokens, output_tokens, total_tokens, reasoning_output_tokens
+                SELECT input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, total_tokens, reasoning_output_tokens
                 FROM turns
                 WHERE session_id = ?
                 ORDER BY turn_index
@@ -225,6 +275,7 @@ class CodexImporterTests(unittest.TestCase):
             {
                 "input_tokens": 100,
                 "cached_input_tokens": 25,
+                "cache_write_tokens": 10,
                 "output_tokens": 100,
                 "total_tokens": 200,
                 "reasoning_output_tokens": 30,
@@ -249,11 +300,13 @@ class CodexImporterTests(unittest.TestCase):
                     is_approximate,
                     input_tokens,
                     cached_input_tokens,
+                    cache_write_tokens,
                     output_tokens,
                     reasoning_output_tokens,
                     total_tokens,
                     cumulative_input_tokens,
                     cumulative_cached_input_tokens,
+                    cumulative_cache_write_tokens,
                     cumulative_output_tokens,
                     cumulative_reasoning_output_tokens,
                     cumulative_total_tokens
@@ -277,11 +330,13 @@ class CodexImporterTests(unittest.TestCase):
                     "is_approximate": 0,
                     "input_tokens": 100,
                     "cached_input_tokens": 25,
+                    "cache_write_tokens": 10,
                     "output_tokens": 100,
                     "reasoning_output_tokens": 30,
                     "total_tokens": 200,
                     "cumulative_input_tokens": 100,
                     "cumulative_cached_input_tokens": 25,
+                    "cumulative_cache_write_tokens": 10,
                     "cumulative_output_tokens": 100,
                     "cumulative_reasoning_output_tokens": 30,
                     "cumulative_total_tokens": 200,
@@ -520,6 +575,7 @@ class CodexImporterTests(unittest.TestCase):
                             "total_token_usage": {
                                 "input_tokens": 100,
                                 "cached_input_tokens": 25,
+                                "cache_write_tokens": 10,
                                 "output_tokens": 100,
                                 "reasoning_output_tokens": 30,
                                 "total_tokens": token_total,
@@ -527,6 +583,7 @@ class CodexImporterTests(unittest.TestCase):
                             "last_token_usage": {
                                 "input_tokens": 100,
                                 "cached_input_tokens": 25,
+                                "cache_write_tokens": 10,
                                 "output_tokens": 100,
                                 "reasoning_output_tokens": 30,
                                 "total_tokens": token_total,

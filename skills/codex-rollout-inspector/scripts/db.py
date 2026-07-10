@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   total_input_tokens      INTEGER DEFAULT 0,
   total_output_tokens     INTEGER DEFAULT 0,
   total_cache_read        INTEGER DEFAULT 0,
+  total_cache_write       INTEGER,
   tool_call_count         INTEGER DEFAULT 0,
   tool_error_count        INTEGER DEFAULT 0,
   total_reasoning_items   INTEGER DEFAULT 0,
@@ -98,6 +99,7 @@ CREATE TABLE IF NOT EXISTS turns (
   duration_ms     INTEGER,
   input_tokens    INTEGER DEFAULT 0,
   cached_input_tokens INTEGER DEFAULT 0,
+  cache_write_tokens INTEGER,
   output_tokens   INTEGER DEFAULT 0,
   total_tokens    INTEGER DEFAULT 0,
   reasoning_item_count INTEGER DEFAULT 0,
@@ -120,11 +122,13 @@ CREATE TABLE IF NOT EXISTS token_usage_events (
   is_approximate          INTEGER DEFAULT 0,
   input_tokens            INTEGER DEFAULT 0,
   cached_input_tokens     INTEGER DEFAULT 0,
+  cache_write_tokens      INTEGER,
   output_tokens           INTEGER DEFAULT 0,
   reasoning_output_tokens INTEGER DEFAULT 0,
   total_tokens            INTEGER DEFAULT 0,
   cumulative_input_tokens INTEGER DEFAULT 0,
   cumulative_cached_input_tokens INTEGER DEFAULT 0,
+  cumulative_cache_write_tokens INTEGER,
   cumulative_output_tokens INTEGER DEFAULT 0,
   cumulative_reasoning_output_tokens INTEGER DEFAULT 0,
   cumulative_total_tokens INTEGER DEFAULT 0

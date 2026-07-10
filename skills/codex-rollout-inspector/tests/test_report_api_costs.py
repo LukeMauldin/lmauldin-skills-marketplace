@@ -41,10 +41,12 @@ def make_token_count(
     *,
     total_input: int,
     total_cached: int,
+    total_cache_write: int | None = None,
     total_output: int,
     total_reasoning: int,
     last_input: int | None = None,
     last_cached: int | None = None,
+    last_cache_write: int | None = None,
     last_output: int | None = None,
     last_reasoning: int | None = None,
 ) -> dict[str, Any]:
@@ -68,6 +70,10 @@ def make_token_count(
             "reasoning_output_tokens": last_reasoning or 0,
             "total_tokens": last_input + (last_output or 0),
         }
+    if total_cache_write is not None:
+        payload["info"]["total_token_usage"]["cache_write_tokens"] = total_cache_write
+    if last_input is not None and last_cache_write is not None:
+        payload["info"]["last_token_usage"]["cache_write_tokens"] = last_cache_write
     return {
         "timestamp": timestamp,
         "type": "event_msg",
@@ -91,6 +97,28 @@ class ReportApiCostsTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
+
+    def test_gpt_56_family_standard_price_catalog(self) -> None:
+        expected = {
+            "gpt-5.6-sol": ("5.00", "0.50", "6.25", "30.00"),
+            "gpt-5.6-terra": ("2.50", "0.25", "3.125", "15.00"),
+            "gpt-5.6-luna": ("1.00", "0.10", "1.25", "6.00"),
+        }
+
+        for model, rates in expected.items():
+            price = report_api_costs.PRICE_CATALOG[model]
+            self.assertEqual(
+                tuple(
+                    str(value)
+                    for value in (
+                        price.input_per_million,
+                        price.cached_input_per_million,
+                        price.cache_write_per_million,
+                        price.output_per_million,
+                    )
+                ),
+                rates,
+            )
 
     def build_report(self, **overrides: Any) -> dict[str, Any]:
         return report_api_costs.build_report(
@@ -261,6 +289,91 @@ class ReportApiCostsTests(unittest.TestCase):
         self.assertEqual(report["by_model"][0]["model"], "gpt-5.5")
         self.assertEqual(report["scan"]["long_context_pricing_events"], 1)
 
+    def test_prices_gpt_56_sol_cache_writes_exactly(self) -> None:
+        self.import_rollout(
+            [
+                {
+                    "timestamp": "2026-04-10T12:00:00Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": THREAD_ID,
+                        "cwd": "/tmp/demo",
+                        "model_provider": "openai",
+                        "source": "cli",
+                        "cli_version": "0.144.1",
+                    },
+                },
+                {
+                    "timestamp": "2026-04-10T12:00:01Z",
+                    "type": "turn_context",
+                    "payload": {"model": "gpt-5.6-sol", "cwd": "/tmp/demo"},
+                },
+                make_token_count(
+                    "2026-04-10T12:00:02Z",
+                    total_input=1000,
+                    total_cached=200,
+                    total_cache_write=300,
+                    total_output=100,
+                    total_reasoning=30,
+                    last_input=1000,
+                    last_cached=200,
+                    last_cache_write=300,
+                    last_output=100,
+                    last_reasoning=30,
+                ),
+            ]
+        )
+
+        report = self.build_report()
+
+        self.assertAlmostEqual(report["totals"]["estimated_cost_usd"], 0.007475, places=6)
+        self.assertEqual(report["totals"]["cache_write_tokens"], 300)
+        self.assertEqual(report["scan"]["missing_cache_write_usage_events"], 0)
+        self.assertEqual(report["by_model"][0]["model"], "gpt-5.6-sol")
+
+    def test_bounds_gpt_56_cost_when_codex_01441_omits_cache_writes(self) -> None:
+        self.import_rollout(
+            [
+                {
+                    "timestamp": "2026-04-10T12:00:00Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": THREAD_ID,
+                        "cwd": "/tmp/demo",
+                        "model_provider": "openai",
+                        "source": "cli",
+                        "cli_version": "0.144.1",
+                    },
+                },
+                {
+                    "timestamp": "2026-04-10T12:00:01Z",
+                    "type": "turn_context",
+                    "payload": {"model": "gpt-5.6", "cwd": "/tmp/demo"},
+                },
+                make_token_count(
+                    "2026-04-10T12:00:02Z",
+                    total_input=1000,
+                    total_cached=200,
+                    total_output=100,
+                    total_reasoning=30,
+                    last_input=1000,
+                    last_cached=200,
+                    last_output=100,
+                    last_reasoning=30,
+                ),
+            ]
+        )
+
+        report = self.build_report()
+
+        self.assertIsNone(report["totals"]["estimated_cost_usd"])
+        self.assertAlmostEqual(report["totals"]["estimated_cost_lower_usd"], 0.0071, places=6)
+        self.assertAlmostEqual(report["totals"]["estimated_cost_upper_usd"], 0.0081, places=6)
+        self.assertEqual(report["scan"]["missing_cache_write_usage_events"], 1)
+        self.assertEqual(report["by_model"][0]["model"], "gpt-5.6-sol")
+        self.assertIn("Codex 0.144.1", report["warnings"][0])
+        self.assertIn("$0.007100–$0.008100", report_api_costs.render_human_report(report))
+
     def test_maps_internal_openai_variant_to_public_model(self) -> None:
         self.import_rollout(
             [
@@ -328,8 +441,6 @@ class ReportApiCostsTests(unittest.TestCase):
         self.assertEqual(report["unpriced"][0]["key"], "dealignai/Gemma-4-31B-JANG_4M-CRACK")
 
     def test_prefers_active_rollout_when_thread_exists_in_active_and_archived(self) -> None:
-        active_path = self.sessions_dir / f"rollout-2026-04-10T12-00-00-{THREAD_ID}.jsonl"
-        archived_path = self.archived_dir / f"rollout-2026-04-10T11-00-00-{THREAD_ID}.jsonl"
         active_rows = [
             {
                 "timestamp": "2026-04-10T12:00:00Z",

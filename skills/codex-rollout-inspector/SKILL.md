@@ -19,13 +19,15 @@ Compared with Claude session logs, Codex rollout files support many of the same 
 - Session naming comes from `session_index.jsonl` (`thread_name`) plus subagent metadata, not Claude-style `slug` or `custom-title` records.
 - Turn durations come from `task_started` and `task_complete` event timestamps, not `system.turn_duration` records.
 - PR links are extractable from assistant text and tool outputs when explicit GitHub PR URLs are present, but there is no dedicated `pr-link` record type.
+- Cold rollouts may be stored as `.jsonl.zst`; the bundled inspector reads plain and zstd-compressed files transparently.
 
 ## Log Kinds
 
 - Session rollouts:
-  - Active: `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-YYYY-MM-DDThh-mm-ss-<thread_id>.jsonl`
-  - Archived: `$CODEX_HOME/archived_sessions/rollout-YYYY-MM-DDThh-mm-ss-<thread_id>.jsonl`
+  - Active: `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-YYYY-MM-DDThh-mm-ss-<thread_id>.jsonl[.zst]`
+  - Archived: `$CODEX_HOME/archived_sessions/rollout-YYYY-MM-DDThh-mm-ss-<thread_id>.jsonl[.zst]`
   - These are the replayable session logs and the primary target for analysis.
+  - Codex 0.144.1 may compress cold rollouts after seven days. If both representations temporarily exist, prefer the plain `.jsonl` file.
 - Session name index:
   - `$CODEX_HOME/session_index.jsonl`
   - Append-only thread-id to thread-name mapping.
@@ -39,17 +41,17 @@ Compared with Claude session logs, Codex rollout files support many of the same 
 ## Compatibility Policy
 
 - Codex rollout files do not embed a dedicated schema version. Treat `session_meta.payload.cli_version` as the best available writer-version hint, and treat the upstream `RolloutLine` source/schema in `openai/codex` as the format authority.
-- This skill is tested against live plain-text `.jsonl` rollouts written by `codex-cli 0.118.0`.
-- This skill was audited against the upstream `RolloutLine` source and internal schema generator as of `2026-04-06`.
-- Support target: post-`2026-03-31` rollout shape. In practice, assume the parser is intended for current rollouts and recent March/April 2026 logs, not for the full historical lifetime of Codex.
-- Older March 2026 logs are best-effort only. Parser behavior may be incomplete when replay/subagent/fork metadata predates the `2026-03-14` to `2026-03-31` rollout changes.
-- Do not claim blanket backward compatibility. When exact historical fidelity matters, validate the target rollout against the upstream `RolloutLine` schema and inspect `session_meta.payload.cli_version` before trusting derived fields.
+- Minimum supported writer version: `codex-cli 0.144.1`. Older Codex versions are out of scope.
+- This skill is tested against live `.jsonl` rollouts written by `codex-cli 0.144.1` and synthetic `.jsonl.zst` rollouts.
+- This skill was audited against the exact upstream `rust-v0.144.1` tag released `2026-07-09`.
+- Codex 0.144.1 adds persisted `world_state` and `inter_agent_communication_metadata` rollout items, richer compaction/window metadata, `thread_settings_applied` and related lifecycle events, and cold-rollout zstd compression. Unknown additive records remain visible in record/event counts even when they do not feed a derived metric.
+- GPT-5.6 API responses report `cache_write_tokens`, but Codex 0.144.1 discards that field while converting response usage into persisted `token_count` records. The inspector cannot recover exact historical cache writes from 0.144.1 rollouts.
 
 ## Workflow
 
 1. Locate the Codex state root and the relevant rollout file.
 2. Confirm whether the user wants active sessions, archived sessions, or both.
-3. For sessions from `2026-03-15` and newer, treat rollout files as newline-delimited `RolloutLine` JSON objects with top-level `timestamp`, `type`, and `payload`.
+3. Treat rollout files as newline-delimited `RolloutLine` JSON objects with top-level `timestamp`, `type`, and `payload`, optionally wrapped in zstd compression.
 4. Start with a summary:
    - session metadata and git context
    - session name from `session_index.jsonl`
@@ -57,6 +59,7 @@ Compared with Claude session logs, Codex rollout files support many of the same 
    - for subagents, treat that preview as the delegated task when the child rollout repeats the parent prompt history before the actual assignment
    - latest turn context, with `cwd` taken from the most recent `turn_context` when present
    - cumulative token usage snapshot and approximate API-call count
+   - cache reads and cache writes when persisted; keep missing cache writes distinct from zero
    - tool usage frequency across function/custom/native Codex calls, plus explicit tool error counts derived from correlated outputs and failure-like native statuses
    - turn durations
    - PR links
@@ -79,9 +82,9 @@ Compared with Claude session logs, Codex rollout files support many of the same 
 - Rebuild the cache from raw rollouts with:
   - `uv run --python 3.14 scripts/inspect_rollout.py rebuild`
 - List recent rollout files with:
-  - `uv run --python 3.14 scripts/inspect_rollout.py list --since 2026-03-15 --limit 20`
+  - `uv run --python 3.14 scripts/inspect_rollout.py list --since 2026-07-09 --limit 20`
 - List recent rollout files for one project/cwd with:
-  - `uv run --python 3.14 scripts/inspect_rollout.py list --since 2026-03-15 --project KidStrongBedrock --limit 20`
+  - `uv run --python 3.14 scripts/inspect_rollout.py list --since 2026-07-09 --project KidStrongBedrock --limit 20`
 - Summarize the newest rollout with:
   - `uv run --python 3.14 scripts/inspect_rollout.py summary`
 - Summarize the newest rollout using the ingestion profile with:
@@ -97,20 +100,24 @@ Compared with Claude session logs, Codex rollout files support many of the same 
 - Summarize subagent rollouts using the ingestion profile with:
   - `uv run --python 3.14 scripts/inspect_rollout.py --json --profile ingestion subagents <path-or-thread-id>`
 - Estimate what a date range of Codex usage would have cost at documented OpenAI API prices with:
-  - `uv run --python 3.14 scripts/report_api_costs.py --begin 2026-04-01 --end 2026-04-16`
+  - `uv run --python 3.14 scripts/report_api_costs.py --begin 2026-07-09 --end 2026-07-10`
+  - GPT-5.6 results are exact when `cache_write_tokens` exists. For 0.144.1 rollouts, the report emits lower/upper bounds because the writer omitted cache-write usage.
 
 ## Parsing Guidance
 
 - Expect the first valid record to be `session_meta`.
 - Treat `session_meta.payload.id` as the canonical thread id.
 - Prefer `session_meta.payload.cli_version` as the rollout writer-version hint. There is no embedded `schema_version` or `format_version` field in `RolloutLine`.
+- Support both plain `.jsonl` and compressed `.jsonl.zst` rollouts. Use the bundled script for transparent discovery and reading; raw `jq` requires decompression first.
 - Use `session_index.jsonl` to recover the user-facing thread name.
 - Prefer `event_msg.user_message` over user-role `response_item` messages when you need the true first user prompt. Response-item user messages can include injected environment/context blocks.
 - For subagent rollouts, Codex may copy the parent prompt history into the child transcript before the delegated task. When a parent rollout is available, prefer the first child user message after the shared parent-prefix prompts as the delegated task preview.
 - Prefer the last `turn_context.payload.cwd` over `session_meta.payload.cwd` when you need the most recent working directory.
 - Treat `session_meta.agent_nickname`, `agent_role`, `agent_path`, `forked_from_id`, and `session_meta.source.subagent.thread_spawn` as the Codex equivalents of Claude subagent naming/identity fields.
 - Codex does not have `slug`, `custom-title`, or `pr-link` records. Use `thread_name`, explicit subagent metadata, and URL extraction from message/tool-output text instead.
-- Codex does not expose a Claude-style `requestId`. Token accounting should use the latest cumulative `token_count.info.total_token_usage` snapshot and, if needed, an approximate API-call count derived from changed snapshots.
+- Codex does not expose a Claude-style `requestId`. Token accounting should use the latest cumulative `token_count.info.total_token_usage` snapshot and, if needed, an approximate API-call count derived from changed snapshots, including `cache_write_tokens` in the snapshot signature when present.
+- `cached_input_tokens` means cache reads. `cache_write_tokens` means cache writes and must remain nullable: `0` is an observed zero, while `NULL` means the rollout writer did not persist the field.
+- OpenAI standard GPT-5.6 pricing bills cache writes at 1.25 times uncached input. `report_api_costs.py` prices Sol, Terra, Luna, and the `gpt-5.6` alias; it applies the documented long-context multiplier above 272K input tokens.
 - Turn duration is derived from the wall-clock difference between `task_started` and `task_complete` events sharing the same `turn_id`.
 - `list`, `summary`, and `subagents` prefer the SQLite cache when it exists and fall back to stateless parsing when it does not. `records` remains raw-rollout only.
 - `refresh` incrementally imports changed rollouts. Child-thread targets are normalized to the root session tree so parent/subagent relationships stay consistent in SQLite. `rebuild` removes the DB and backfills from raw rollouts.
@@ -118,6 +125,7 @@ Compared with Claude session logs, Codex rollout files support many of the same 
 - `locate` now reports DB path, row counts, last import time, pending-marker details, candidate `hooks.json` and `config.toml` paths across user/repo config layers, whether the rollout-inspector Stop hook is already present, and a ready-to-paste Stop-hook command.
 - `--profile ingestion` emits a normalized `session_inspector_v2` shape intended for downstream ingestion. Keep the default profile for operator-facing inspection because it preserves more raw Codex-specific detail.
 - SQLite keeps both the operator-facing `first_user_message` and the raw/derived split: `raw_first_user_message` is the literal first prompt recovered from the rollout, while `delegated_task` is the child-specific task preview when applicable.
+- SQLite schema v7 is rebuild-oriented. Opening an older cache replaces its derived tables; run `rebuild` to backfill all raw rollouts after upgrading.
 - Hooks require the `hooks` feature flag in an active `config.toml`:
   - `[features]`
   - `hooks = true`
@@ -125,12 +133,14 @@ Compared with Claude session logs, Codex rollout files support many of the same 
 - Codex does not discover `hooks.json` from the plugin root. Configure the Stop hook in `~/.codex/hooks.json` or another active Codex config folder, and use the command from `inspect_rollout.py locate`. That command prefers an installed skill at `CODEX_HOME/skills/codex-rollout-inspector/...` and falls back to the newest plugin-cache copy under `CODEX_HOME/plugins/cache`.
 - Do not overwrite an existing `hooks.json` during installation. Merge the rollout-inspector Stop hook into an active config-layer file instead; Codex loads matching hooks from multiple config layers.
 - The Stop hook imports the hook `transcript_path` immediately when Codex provides one, then writes a delayed reconcile marker because Stop can run before Codex appends final turn-completion records. Subsequent Stop hooks and `refresh --pending` process due reconcile markers.
+- Exact-path Stop imports use a metadata-only rollout tree index. They read one `session_meta` record per rollout for parent/child discovery instead of building the full operator-facing summary index on every hook process.
 - If a Stop hook arrives without `transcript_path`, the hook only imports by `session_id` when that id resolves to an existing rollout. Unresolved hook session ids are recorded as non-retryable pending diagnostics instead of being treated as successful rollout targets.
+- Pending reconciliation falls back from a missing rollout path to `session_id`, allowing markers to follow rollouts moved from `sessions/` to `archived_sessions/`.
 - `--tool-name` can match native call types as well as named function/custom tools. For example, `--tool-name local_shell_call` isolates shell-call records even though they do not carry `payload.name`.
 - Support both persistence levels:
   - Limited: core user-visible lifecycle and content
   - Extended: additional completion/end-state events
-- Tolerate additive fields. March 2026 changes were mostly additive, not a full format reset, but parser-visible behavior still changed around fork replay, response-item serialization, and rollout persistence during March 2026.
+- Tolerate additive fields and record types. In 0.144.1, `world_state`, inter-agent metadata, compaction window identifiers, and additional lifecycle events are additive to the core `session_meta`/`turn_context`/`event_msg`/`response_item` flow.
 
 ## Analysis Tables
 
@@ -147,8 +157,9 @@ New aggregate/session columns:
 
 | Table | Columns |
 |------|---------|
-| `sessions` | `total_reasoning_items`, `total_encrypted_reasoning_items`, `total_reasoning_content_len`, `total_reasoning_tokens`, `user_message_count`, `user_interrupt_count`, `total_user_char_count` |
-| `turns` | `reasoning_item_count`, `tool_use_block_count`, `reasoning_output_tokens` |
+| `sessions` | `total_reasoning_items`, `total_encrypted_reasoning_items`, `total_reasoning_content_len`, `total_reasoning_tokens`, `total_cache_write`, `user_message_count`, `user_interrupt_count`, `total_user_char_count` |
+| `turns` | `reasoning_item_count`, `tool_use_block_count`, `reasoning_output_tokens`, nullable `cache_write_tokens` |
+| `token_usage_events` | nullable `cache_write_tokens`, nullable `cumulative_cache_write_tokens` |
 | `tool_calls` | `call_order` |
 
 Codex-specific behavior:
@@ -169,6 +180,7 @@ Codex-specific behavior:
 - `sessions.total_reasoning_tokens` stores the latest cumulative `reasoning_output_tokens` value so reasoning spend is queryable without JSON extraction.
 - `user_messages.is_interrupt` is set when a `user_message` arrives between `task_started` and `task_complete` boundaries for an active turn.
 - Operator-facing JSON summaries still expose rollout-derived fields such as approximate API-call counts and cached-input-token snapshots. The schema cleanup only removed dead SQLite columns, not useful summary output.
+- The `session_inspector_v2` ingestion profile now maps cache writes to `usage.tokens.cache_create`; it remains `null` for 0.144.1 rollouts because the writer omitted the source field.
 
 Example SQL:
 

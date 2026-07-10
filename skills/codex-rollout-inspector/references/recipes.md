@@ -27,36 +27,40 @@ Active:
 
 ```bash
 CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"
-find "$CODEX_ROOT/sessions" -maxdepth 4 -type f -name 'rollout-*.jsonl' | sort | tail -n 1
+find "$CODEX_ROOT/sessions" -maxdepth 4 -type f \
+  \( -name 'rollout-*.jsonl' -o -name 'rollout-*.jsonl.zst' \) | sort | tail -n 1
 ```
 
 Archived:
 
 ```bash
 CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"
-find "$CODEX_ROOT/archived_sessions" -maxdepth 1 -type f -name 'rollout-*.jsonl' | sort | tail -n 1
+find "$CODEX_ROOT/archived_sessions" -maxdepth 1 -type f \
+  \( -name 'rollout-*.jsonl' -o -name 'rollout-*.jsonl.zst' \) | sort | tail -n 1
 ```
 
-## Restrict To `2026-03-15` And Newer
+## Version Scope
 
-```bash
-CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"
-find "$CODEX_ROOT/sessions" -maxdepth 4 -type f -name 'rollout-*.jsonl' \
-  | awk '/\/sessions\/2026\/03\/(1[5-9]|[2-3][0-9])\/|\/sessions\/2026\/0[4-9]\//'
-```
+The inspector requires rollout files written by Codex 0.144.1 or newer. Check
+`session_meta.payload.cli_version` before relying on derived data from an
+unknown writer version.
 
 For general date handling, prefer the Python script:
 
 ```bash
-uv run --python 3.14 scripts/inspect_rollout.py list --since 2026-03-15 --limit 20
+uv run --python 3.14 scripts/inspect_rollout.py list --since 2026-07-09 --limit 20
 ```
 
 Estimate API-equivalent spend over a date range:
 
 ```bash
-uv run --python 3.14 scripts/report_api_costs.py --begin 2026-04-01 --end 2026-04-16
-uv run --python 3.14 scripts/report_api_costs.py --begin 2026-04-01T00:00:00Z --end 2026-04-16T23:59:59Z --json
+uv run --python 3.14 scripts/report_api_costs.py --begin 2026-07-09 --end 2026-07-10
+uv run --python 3.14 scripts/report_api_costs.py --begin 2026-07-09T00:00:00Z --end 2026-07-10T23:59:59Z --json
 ```
+
+GPT-5.6 cache writes are billed separately. Codex 0.144.1 does not persist the
+API's `cache_write_tokens`, so affected results are emitted as lower/upper cost
+bounds. An exact single cost is emitted when cache-write usage is present.
 
 ## Ingestion Profile
 
@@ -78,7 +82,7 @@ Incremental refresh:
 
 ```bash
 uv run --python 3.14 scripts/inspect_rollout.py refresh
-uv run --python 3.14 scripts/inspect_rollout.py refresh --since 2026-03-15
+uv run --python 3.14 scripts/inspect_rollout.py refresh --since 2026-07-09
 uv run --python 3.14 scripts/inspect_rollout.py refresh 019d2494-6c37-7c93-9df6-7ed84372b136
 ```
 
@@ -100,7 +104,7 @@ Enable Codex hooks in an active `config.toml` such as `~/.codex/config.toml` or 
 
 ```toml
 [features]
-codex_hooks = true
+hooks = true
 ```
 
 Install the rollout-inspector Stop hook by merging this fragment into an active `hooks.json` such as `~/.codex/hooks.json` or `<repo>/.codex/hooks.json`:
@@ -171,6 +175,21 @@ Assume:
 
 ```bash
 f=".../rollout-...jsonl"
+```
+
+Codex 0.144.1 can compress cold rollouts to `.jsonl.zst`. The bundled Python
+script reads both forms transparently. For a raw `jq` recipe, decompress first:
+
+```bash
+zstd -dc -- "$f" | jq -c 'select(.type == "session_meta") | .payload'
+```
+
+If `zstd` is unavailable, use Python 3.14's standard-library zstd support:
+
+```bash
+uv run --python 3.14 python3 -c \
+  'import sys; from compression import zstd; sys.stdout.buffer.write(zstd.decompress(open(sys.argv[1], "rb").read()))' \
+  "$f" | jq -c 'select(.type == "session_meta") | .payload'
 ```
 
 ### Top-level record types
@@ -295,6 +314,7 @@ jq -r '
   | [
       (.input_tokens // 0),
       (.cached_input_tokens // 0),
+      (.cache_write_tokens // null),
       (.output_tokens // 0),
       (.reasoning_output_tokens // 0),
       (.total_tokens // 0)
@@ -346,19 +366,8 @@ jq -c '
 Find child rollouts for one parent thread id:
 
 ```bash
-CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"
 parent="019d2494-6c37-7c93-9df6-7ed84372b136"
-
-find "$CODEX_ROOT/sessions" "$CODEX_ROOT/archived_sessions" -type f -name 'rollout-*.jsonl' -print0 \
-  | xargs -0 jq -c --arg parent "$parent" '
-      select(.type=="session_meta")
-      | .payload
-      | select(
-          .forked_from_id == $parent
-          or .source.subagent.thread_spawn.parent_thread_id == $parent
-        )
-      | {id, forked_from_id, source, agent_nickname, agent_role, agent_path}
-    '
+uv run --python 3.14 scripts/inspect_rollout.py --json subagents "$parent"
 ```
 
 ### PR links
@@ -470,6 +479,7 @@ for raw in path.read_text(encoding="utf-8").splitlines():
     signature = (
         total.get("input_tokens"),
         total.get("cached_input_tokens"),
+        total.get("cache_write_tokens"),
         total.get("output_tokens"),
         total.get("reasoning_output_tokens"),
         total.get("total_tokens"),
@@ -596,7 +606,7 @@ Use the bundled script for repeatable inspection:
 
 ```bash
 uv run --python 3.14 scripts/inspect_rollout.py locate
-uv run --python 3.14 scripts/inspect_rollout.py list --since 2026-03-15 --limit 10
+uv run --python 3.14 scripts/inspect_rollout.py list --since 2026-07-09 --limit 10
 uv run --python 3.14 scripts/inspect_rollout.py list --project KidStrongBedrock --limit 10
 uv run --python 3.14 scripts/inspect_rollout.py summary
 uv run --python 3.14 scripts/inspect_rollout.py --json --profile ingestion summary

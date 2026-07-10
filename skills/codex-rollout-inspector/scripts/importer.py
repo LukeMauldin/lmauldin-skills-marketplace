@@ -13,7 +13,7 @@ from typing import Any
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-PARSER_VERSION = 6
+PARSER_VERSION = 7
 BATCH_SIZE = 50
 SOURCE = "codex_cli"
 
@@ -56,6 +56,11 @@ def reconcile_pending(codex_home: Path) -> list[str]:
         target = payload.get("target") or payload.get("session_id")
         if not isinstance(target, str) or not target:
             return False
+        target_path = Path(target).expanduser()
+        session_id = payload.get("session_id")
+        if target_path.is_absolute() and not target_path.exists():
+            if isinstance(session_id, str) and session_id:
+                target = session_id
         try:
             refresh_rollouts(
                 codex_home,
@@ -174,21 +179,28 @@ def _collect_refresh_targets(
 ) -> list[Path]:
     paths = parser.resolve_paths(codex_home)
     thread_names = parser.load_session_index(paths.session_index_path)
-    cache = parser.get_quick_rollout_cache(paths, thread_names)
+    tree_cache = parser.get_rollout_tree_cache(paths)
     raw_targets: list[Path] = []
     if rollout_paths is not None:
         raw_targets.extend(path.expanduser() for path in rollout_paths)
     elif target is not None:
-        raw_targets.append(
-            parser.resolve_target(
-                paths,
-                thread_names,
-                target,
-                archived=bool(archived),
-                project=project,
+        candidate_path = Path(target).expanduser()
+        if candidate_path.exists():
+            raw_targets.append(candidate_path)
+        elif project is None and parser.THREAD_ID_RE.match(target):
+            raw_targets.append(tree_cache.resolve_thread_id(target))
+        else:
+            raw_targets.append(
+                parser.resolve_target(
+                    paths,
+                    thread_names,
+                    target,
+                    archived=bool(archived),
+                    project=project,
+                )
             )
-        )
     else:
+        cache = parser.get_quick_rollout_cache(paths, thread_names)
         archive_modes = [True] if archived else ([False] if archived is False else [False, True])
         for archived_mode in archive_modes:
             raw_targets.extend(
@@ -200,7 +212,7 @@ def _collect_refresh_targets(
                 )
             )
     normalized_targets = [
-        _tree_root_rollout_path(cache, rollout_path)
+        _tree_root_rollout_path(tree_cache, rollout_path)
         for rollout_path in raw_targets
     ]
     deduped: list[Path] = []
@@ -220,11 +232,11 @@ def _tree_root_rollout_path(
     current_path = rollout_path
     seen_thread_ids: set[str] = set()
     while True:
-        quick = cache.get_quick_info(current_path)
+        quick = cache.get_info(current_path)
         if quick.thread_id in seen_thread_ids:
             return current_path
         seen_thread_ids.add(quick.thread_id)
-        parent_thread_id = quick.parent_thread_id or quick.forked_from_id
+        parent_thread_id = quick.parent_thread_id
         if not parent_thread_id:
             return current_path
         try:
@@ -373,6 +385,11 @@ def _insert_rollout(
         "total_input_tokens": parser.nested_int(token_usage, "latest_total_token_usage", "input_tokens") or 0,
         "total_output_tokens": parser.nested_int(token_usage, "latest_total_token_usage", "output_tokens") or 0,
         "total_cache_read": parser.nested_int(token_usage, "latest_total_token_usage", "cached_input_tokens") or 0,
+        "total_cache_write": parser.nested_int(
+            token_usage,
+            "latest_total_token_usage",
+            "cache_write_tokens",
+        ),
         "tool_call_count": sum((tool_usage.get("all_calls") or {}).values()),
         "tool_error_count": tool_usage.get("tool_error_count") or 0,
         "total_reasoning_items": len(reasoning_items),
@@ -431,13 +448,14 @@ def _insert_rollout(
                 duration_ms,
                 input_tokens,
                 cached_input_tokens,
+                cache_write_tokens,
                 output_tokens,
                 total_tokens,
                 reasoning_item_count,
                 tool_use_block_count,
                 reasoning_output_tokens
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 summary.get("thread_id"),
@@ -448,6 +466,7 @@ def _insert_rollout(
                 turn["duration_ms"],
                 turn["input_tokens"],
                 turn["cached_input_tokens"],
+                turn["cache_write_tokens"],
                 turn["output_tokens"],
                 turn["total_tokens"],
                 reasoning_counts_by_turn.get(turn["turn_index"], 0),
@@ -473,13 +492,14 @@ def _insert_rollout(
                     duration_ms,
                     input_tokens,
                     cached_input_tokens,
+                    cache_write_tokens,
                     output_tokens,
                     total_tokens,
                     reasoning_item_count,
                     tool_use_block_count,
                     reasoning_output_tokens
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     summary.get("thread_id"),
@@ -490,6 +510,7 @@ def _insert_rollout(
                     None,
                     0,
                     0,
+                    None,
                     0,
                     0,
                     0,
@@ -560,16 +581,18 @@ def _insert_rollout(
                 is_approximate,
                 input_tokens,
                 cached_input_tokens,
+                cache_write_tokens,
                 output_tokens,
                 reasoning_output_tokens,
                 total_tokens,
                 cumulative_input_tokens,
                 cumulative_cached_input_tokens,
+                cumulative_cache_write_tokens,
                 cumulative_output_tokens,
                 cumulative_reasoning_output_tokens,
                 cumulative_total_tokens
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 summary.get("thread_id"),
@@ -583,11 +606,13 @@ def _insert_rollout(
                 token_event["is_approximate"],
                 token_event["input_tokens"],
                 token_event["cached_input_tokens"],
+                token_event["cache_write_tokens"],
                 token_event["output_tokens"],
                 token_event["reasoning_output_tokens"],
                 token_event["total_tokens"],
                 token_event["cumulative_input_tokens"],
                 token_event["cumulative_cached_input_tokens"],
+                token_event["cumulative_cache_write_tokens"],
                 token_event["cumulative_output_tokens"],
                 token_event["cumulative_reasoning_output_tokens"],
                 token_event["cumulative_total_tokens"],
@@ -697,6 +722,9 @@ def _extract_turn_and_token_rows(
                     "duration_ms": None,
                     "input_tokens": 0,
                     "cached_input_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "cache_write_tokens_known": True,
+                    "has_token_usage": False,
                     "output_tokens": 0,
                     "total_tokens": 0,
                     "reasoning_item_count": 0,
@@ -741,6 +769,11 @@ def _extract_turn_and_token_rows(
         )
         turn_row["input_tokens"] += usage["input_tokens"]
         turn_row["cached_input_tokens"] += usage["cached_input_tokens"]
+        turn_row["has_token_usage"] = True
+        if usage["cache_write_tokens"] is None:
+            turn_row["cache_write_tokens_known"] = False
+        elif turn_row["cache_write_tokens_known"]:
+            turn_row["cache_write_tokens"] += usage["cache_write_tokens"]
         turn_row["output_tokens"] += usage["output_tokens"]
         turn_row["total_tokens"] += usage["total_tokens"]
         turn_row["reasoning_output_tokens"] += usage["reasoning_output_tokens"]
@@ -755,11 +788,13 @@ def _extract_turn_and_token_rows(
                 "is_approximate": is_approximate,
                 "input_tokens": usage["input_tokens"],
                 "cached_input_tokens": usage["cached_input_tokens"],
+                "cache_write_tokens": usage["cache_write_tokens"],
                 "output_tokens": usage["output_tokens"],
                 "reasoning_output_tokens": usage["reasoning_output_tokens"],
                 "total_tokens": usage["total_tokens"],
                 "cumulative_input_tokens": total_usage["input_tokens"],
                 "cumulative_cached_input_tokens": total_usage["cached_input_tokens"],
+                "cumulative_cache_write_tokens": total_usage["cache_write_tokens"],
                 "cumulative_output_tokens": total_usage["output_tokens"],
                 "cumulative_reasoning_output_tokens": total_usage["reasoning_output_tokens"],
                 "cumulative_total_tokens": total_usage["total_tokens"],
@@ -775,6 +810,9 @@ def _extract_turn_and_token_rows(
                 "duration_ms": None,
                 "input_tokens": 0,
                 "cached_input_tokens": 0,
+                "cache_write_tokens": 0,
+                "cache_write_tokens_known": True,
+                "has_token_usage": False,
                 "output_tokens": 0,
                 "total_tokens": 0,
                 "reasoning_item_count": 0,
@@ -782,6 +820,9 @@ def _extract_turn_and_token_rows(
                 "reasoning_output_tokens": 0,
             }
         )
+    for turn in turns:
+        if not turn.pop("cache_write_tokens_known") or not turn.pop("has_token_usage"):
+            turn["cache_write_tokens"] = None
     return turns, token_rows
 
 
@@ -816,6 +857,9 @@ def _ensure_turn_row(
                 "duration_ms": None,
                 "input_tokens": 0,
                 "cached_input_tokens": 0,
+                "cache_write_tokens": 0,
+                "cache_write_tokens_known": True,
+                "has_token_usage": False,
                 "output_tokens": 0,
                 "total_tokens": 0,
                 "reasoning_item_count": 0,
@@ -831,9 +875,13 @@ def _ensure_turn_row(
     return row
 
 
-def _parse_token_usage(parser: Any, payload: dict[str, Any]) -> dict[str, int]:
+def _parse_token_usage(parser: Any, payload: dict[str, Any]) -> dict[str, int | None]:
     input_tokens = max(parser.int_or_none(payload.get("input_tokens")) or 0, 0)
     cached_input_tokens = max(parser.int_or_none(payload.get("cached_input_tokens")) or 0, 0)
+    raw_cache_write_tokens = parser.int_or_none(payload.get("cache_write_tokens"))
+    cache_write_tokens = (
+        max(raw_cache_write_tokens, 0) if raw_cache_write_tokens is not None else None
+    )
     output_tokens = max(parser.int_or_none(payload.get("output_tokens")) or 0, 0)
     reasoning_output_tokens = max(parser.int_or_none(payload.get("reasoning_output_tokens")) or 0, 0)
     total_tokens = max(
@@ -843,25 +891,39 @@ def _parse_token_usage(parser: Any, payload: dict[str, Any]) -> dict[str, int]:
     return {
         "input_tokens": input_tokens,
         "cached_input_tokens": min(cached_input_tokens, input_tokens),
+        "cache_write_tokens": (
+            min(cache_write_tokens, input_tokens) if cache_write_tokens is not None else None
+        ),
         "output_tokens": output_tokens,
         "reasoning_output_tokens": reasoning_output_tokens,
         "total_tokens": total_tokens,
     }
 
 
-def _diff_token_usage(current: dict[str, int], previous: dict[str, int]) -> dict[str, int]:
+def _diff_token_usage(
+    current: dict[str, int | None],
+    previous: dict[str, int | None],
+) -> dict[str, int | None]:
+    current_cache_write = current["cache_write_tokens"]
+    previous_cache_write = previous["cache_write_tokens"]
     return {
-        "input_tokens": max(current["input_tokens"] - previous["input_tokens"], 0),
+        "input_tokens": max(int(current["input_tokens"]) - int(previous["input_tokens"]), 0),
         "cached_input_tokens": max(
-            current["cached_input_tokens"] - previous["cached_input_tokens"],
+            int(current["cached_input_tokens"]) - int(previous["cached_input_tokens"]),
             0,
         ),
-        "output_tokens": max(current["output_tokens"] - previous["output_tokens"], 0),
+        "cache_write_tokens": (
+            max(current_cache_write - previous_cache_write, 0)
+            if current_cache_write is not None and previous_cache_write is not None
+            else None
+        ),
+        "output_tokens": max(int(current["output_tokens"]) - int(previous["output_tokens"]), 0),
         "reasoning_output_tokens": max(
-            current["reasoning_output_tokens"] - previous["reasoning_output_tokens"],
+            int(current["reasoning_output_tokens"])
+            - int(previous["reasoning_output_tokens"]),
             0,
         ),
-        "total_tokens": max(current["total_tokens"] - previous["total_tokens"], 0),
+        "total_tokens": max(int(current["total_tokens"]) - int(previous["total_tokens"]), 0),
     }
 
 

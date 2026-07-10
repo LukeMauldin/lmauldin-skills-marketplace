@@ -5,6 +5,7 @@ import json
 import sys
 import tempfile
 import unittest
+from compression import zstd
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,97 @@ def write_jsonl(path: Path, rows: list[dict[str, Any] | str]) -> None:
 
 
 class InspectRolloutTests(unittest.TestCase):
+    def test_discovers_and_loads_compressed_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir) / ".codex"
+            sessions_dir = codex_home / "sessions" / "2026" / "07" / "10"
+            sessions_dir.mkdir(parents=True)
+            compressed_path = sessions_dir / (
+                f"rollout-2026-07-10T12-00-00-{THREAD_ID}.jsonl.zst"
+            )
+            rows = [
+                {
+                    "timestamp": "2026-07-10T12:00:00Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": THREAD_ID,
+                        "cwd": "/tmp/compressed",
+                        "cli_version": "0.144.1",
+                        "source": "cli",
+                    },
+                },
+                {
+                    "timestamp": "2026-07-10T12:00:01Z",
+                    "type": "turn_context",
+                    "payload": {"cwd": "/tmp/compressed", "model": "gpt-5.6-sol"},
+                },
+            ]
+            with zstd.open(compressed_path, mode="wt", encoding="utf-8") as handle:
+                handle.write("\n".join(json.dumps(row) for row in rows) + "\n")
+
+            paths = inspect_rollout.resolve_paths(codex_home)
+            discovered = inspect_rollout.collect_rollouts_in_root(paths.sessions_dir)
+            loaded = inspect_rollout.load_rollout(compressed_path)
+            quick = inspect_rollout.quick_rollout_info(compressed_path, {})
+
+            self.assertEqual(discovered, [compressed_path])
+            self.assertEqual(len(loaded.records), 2)
+            self.assertEqual(loaded.parse_errors, 0)
+            self.assertEqual(quick.thread_id, THREAD_ID)
+            self.assertEqual(quick.model, "gpt-5.6-sol")
+
+    def test_summarize_token_usage_includes_cache_writes(self) -> None:
+        summary = inspect_rollout.summarize_token_usage(
+            [
+                {
+                    "timestamp": "2026-07-10T12:00:00Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 200,
+                                "cache_write_tokens": 300,
+                                "output_tokens": 100,
+                                "reasoning_output_tokens": 30,
+                                "total_tokens": 1100,
+                            }
+                        },
+                    },
+                }
+            ]
+        )
+
+        self.assertEqual(
+            summary["latest_total_token_usage"]["cache_write_tokens"],
+            300,
+        )
+        self.assertEqual(summary["api_call_count_approx"], 1)
+
+    def test_ingestion_summary_maps_cache_writes_to_cache_create(self) -> None:
+        paths = inspect_rollout.resolve_paths(Path("/tmp/codex-home"))
+        payload = inspect_rollout.build_ingestion_summary(
+            {
+                "thread_id": THREAD_ID,
+                "token_usage": {
+                    "latest_total_token_usage": {
+                        "input_tokens": 1000,
+                        "cached_input_tokens": 200,
+                        "cache_write_tokens": 300,
+                        "output_tokens": 100,
+                        "reasoning_output_tokens": 30,
+                        "total_tokens": 1100,
+                    }
+                },
+            },
+            paths,
+            {},
+            kind="session_summary",
+        )
+
+        self.assertEqual(payload["usage"]["tokens"]["cache_create"], 300)
+
     def test_locate_payload_reports_hook_candidates_feature_flags_and_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

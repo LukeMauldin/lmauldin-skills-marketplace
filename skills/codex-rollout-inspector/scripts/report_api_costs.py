@@ -4,13 +4,16 @@
 # ///
 """Estimate OpenAI API token costs from Codex rollout logs.
 
-Uses the rollout-inspector SQLite cache under `${CODEX_HOME:-~/.codex}` when it
-is available and falls back to raw rollout JSONL scanning otherwise. The report
-estimates what the recorded usage would have cost at current documented OpenAI
-API standard pricing.
+Uses the rollout-inspector SQLite cache under `${CODEX_HOME:-~/.codex}`. The
+report estimates what the recorded usage would have cost at current documented
+OpenAI API standard pricing.
 
-Pricing catalog sources, checked 2026-05-22:
+Pricing catalog sources, checked 2026-07-10:
 - https://developers.openai.com/api/docs/pricing
+- https://developers.openai.com/api/docs/guides/prompt-caching
+- https://developers.openai.com/api/docs/models/gpt-5.6-sol
+- https://developers.openai.com/api/docs/models/gpt-5.6-terra
+- https://developers.openai.com/api/docs/models/gpt-5.6-luna
 - https://developers.openai.com/api/docs/models/gpt-5.5
 - https://developers.openai.com/api/docs/models/gpt-5.5-pro
 - https://developers.openai.com/api/docs/models/gpt-5.4
@@ -39,8 +42,8 @@ import sys
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from contextlib import closing
-from dataclasses import asdict, dataclass
-from datetime import UTC, date, datetime, time, timedelta, tzinfo
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, time, tzinfo
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
@@ -52,9 +55,13 @@ logger = logging.getLogger(__name__)
 MICRO_USD = Decimal("0.000001")
 USD_PRECISION = Decimal("0.000001")
 USD_DISPLAY_PRECISION = Decimal("0.01")
-PRICE_CATALOG_AS_OF = "2026-05-22"
+PRICE_CATALOG_AS_OF = "2026-07-10"
 SOURCE_URLS = [
     "https://developers.openai.com/api/docs/pricing",
+    "https://developers.openai.com/api/docs/guides/prompt-caching",
+    "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+    "https://developers.openai.com/api/docs/models/gpt-5.6-terra",
+    "https://developers.openai.com/api/docs/models/gpt-5.6-luna",
     "https://developers.openai.com/api/docs/models/gpt-5.5",
     "https://developers.openai.com/api/docs/models/gpt-5.5-pro",
     "https://developers.openai.com/api/docs/models/gpt-5.4",
@@ -103,6 +110,7 @@ class PriceInfo:
     output_per_million: Decimal
     context_window: int
     max_output_tokens: int
+    cache_write_per_million: Decimal | None = None
     long_context_threshold: int | None = None
     long_context_input_multiplier: Decimal = Decimal("1")
     long_context_output_multiplier: Decimal = Decimal("1")
@@ -112,6 +120,7 @@ class PriceInfo:
 class TokenUsage:
     input_tokens: int
     cached_input_tokens: int
+    cache_write_tokens: int | None
     output_tokens: int
     reasoning_output_tokens: int
     total_tokens: int
@@ -119,6 +128,21 @@ class TokenUsage:
     @property
     def uncached_input_tokens(self) -> int:
         return max(self.input_tokens - self.cached_input_tokens, 0)
+
+    @property
+    def standard_input_tokens(self) -> int:
+        cache_write_tokens = self.cache_write_tokens or 0
+        return max(self.input_tokens - self.cached_input_tokens - cache_write_tokens, 0)
+
+
+@dataclass(slots=True, frozen=True)
+class CostEstimate:
+    lower_usd: Decimal
+    upper_usd: Decimal
+
+    @property
+    def exact(self) -> bool:
+        return self.lower_usd == self.upper_usd
 
 
 @dataclass(slots=True, frozen=True)
@@ -147,7 +171,7 @@ class UsageEvent:
     usage_is_approximate: bool
     long_context_pricing: bool
     token_usage: TokenUsage
-    cost_usd: Decimal | None
+    cost_estimate: CostEstimate | None
 
 
 @dataclass(slots=True, frozen=True)
@@ -161,6 +185,42 @@ class LoadedEventSet:
 
 
 PRICE_CATALOG: dict[str, PriceInfo] = {
+    "gpt-5.6-sol": PriceInfo(
+        model_id="gpt-5.6-sol",
+        input_per_million=Decimal("5.00"),
+        cached_input_per_million=Decimal("0.50"),
+        cache_write_per_million=Decimal("6.25"),
+        output_per_million=Decimal("30.00"),
+        context_window=1_050_000,
+        max_output_tokens=128_000,
+        long_context_threshold=272_000,
+        long_context_input_multiplier=Decimal("2"),
+        long_context_output_multiplier=Decimal("1.5"),
+    ),
+    "gpt-5.6-terra": PriceInfo(
+        model_id="gpt-5.6-terra",
+        input_per_million=Decimal("2.50"),
+        cached_input_per_million=Decimal("0.25"),
+        cache_write_per_million=Decimal("3.125"),
+        output_per_million=Decimal("15.00"),
+        context_window=1_050_000,
+        max_output_tokens=128_000,
+        long_context_threshold=272_000,
+        long_context_input_multiplier=Decimal("2"),
+        long_context_output_multiplier=Decimal("1.5"),
+    ),
+    "gpt-5.6-luna": PriceInfo(
+        model_id="gpt-5.6-luna",
+        input_per_million=Decimal("1.00"),
+        cached_input_per_million=Decimal("0.10"),
+        cache_write_per_million=Decimal("1.25"),
+        output_per_million=Decimal("6.00"),
+        context_window=1_050_000,
+        max_output_tokens=128_000,
+        long_context_threshold=272_000,
+        long_context_input_multiplier=Decimal("2"),
+        long_context_output_multiplier=Decimal("1.5"),
+    ),
     "gpt-5.5": PriceInfo(
         model_id="gpt-5.5",
         input_per_million=Decimal("5.00"),
@@ -285,6 +345,9 @@ PRICE_CATALOG: dict[str, PriceInfo] = {
 }
 
 SNAPSHOT_ALIASES = {
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
     "gpt-5.5",
     "gpt-5.5-pro",
     "gpt-5.4",
@@ -298,6 +361,10 @@ SNAPSHOT_ALIASES = {
     "gpt-5.2",
     "gpt-5.2-codex",
     "gpt-5.3-codex",
+}
+
+PUBLIC_MODEL_ALIASES = {
+    "gpt-5.6": "gpt-5.6-sol",
 }
 
 CLOSEST_PUBLIC_MODEL_MAP = {
@@ -496,6 +563,7 @@ def load_usage_events_from_sqlite(
     unpriced_counter = Counter()
     events: list[UsageEvent] = []
     sessions_with_approximate_usage: set[str] = set()
+    sessions_with_missing_cache_writes: set[str] = set()
 
     try:
         with closing(DB.open_db(db_path)) as conn:
@@ -526,12 +594,22 @@ def load_usage_events_from_sqlite(
                 events.append(event)
                 if event.usage_is_approximate:
                     sessions_with_approximate_usage.add(event.session_id)
+                if (
+                    event.cost_estimate is not None
+                    and not event.cost_estimate.exact
+                ):
+                    sessions_with_missing_cache_writes.add(event.session_id)
     except sqlite3.Error as exc:
         raise RuntimeError(f"failed to query SQLite cache at {db_path}: {exc}") from exc
 
     for session_id in sorted(sessions_with_approximate_usage):
         warnings.append(
             f"{session_id}: some requests used cumulative-token fallback because last_token_usage was absent"
+        )
+    for session_id in sorted(sessions_with_missing_cache_writes):
+        warnings.append(
+            f"{session_id}: Codex 0.144.1 did not persist GPT-5.6 cache_write_tokens; "
+            "cost is bounded from zero writes to all non-cached input being written"
         )
     return LoadedEventSet(
         events=events,
@@ -591,6 +669,7 @@ def fetch_sqlite_usage_rows(
             tue.is_approximate,
             tue.input_tokens,
             tue.cached_input_tokens,
+            tue.cache_write_tokens,
             tue.output_tokens,
             tue.reasoning_output_tokens,
             tue.total_tokens
@@ -633,6 +712,11 @@ def usage_event_from_sqlite_row(
     token_usage = TokenUsage(
         input_tokens=max(int_or_zero(row["input_tokens"]), 0),
         cached_input_tokens=max(int_or_zero(row["cached_input_tokens"]), 0),
+        cache_write_tokens=(
+            max(int_or_zero(row["cache_write_tokens"]), 0)
+            if row["cache_write_tokens"] is not None
+            else None
+        ),
         output_tokens=max(int_or_zero(row["output_tokens"]), 0),
         reasoning_output_tokens=max(int_or_zero(row["reasoning_output_tokens"]), 0),
         total_tokens=max(int_or_zero(row["total_tokens"]), 0),
@@ -648,21 +732,23 @@ def usage_event_from_sqlite_row(
     if model_resolution.pricing_model is None:
         unpriced_key = model_resolution.raw_model or provider or "missing-model"
         unpriced_counter[unpriced_key] += 1
-        cost_usd = None
+        cost_estimate = None
     else:
-        cost_usd = compute_cost(
+        cost_estimate = compute_cost_estimate(
             pricing_model=model_resolution.pricing_model,
             token_usage=token_usage,
         )
     long_context = is_long_context_request(model_resolution.pricing_model, token_usage)
     usage_is_approximate = bool(row["is_approximate"])
-    event_counter["priced" if cost_usd is not None else "unpriced"] += 1
+    event_counter["priced" if cost_estimate is not None else "unpriced"] += 1
     if usage_is_approximate:
         event_counter["approximate_usage"] += 1
     if long_context:
         event_counter["long_context_pricing"] += 1
     if model_resolution.estimated:
         event_counter["estimated_model_mapping"] += 1
+    if cost_estimate is not None and not cost_estimate.exact:
+        event_counter["missing_cache_write_usage"] += 1
     local_timestamp = timestamp.astimezone(display_timezone)
     return UsageEvent(
         session_id=str(row["session_id"]),
@@ -680,7 +766,7 @@ def usage_event_from_sqlite_row(
         usage_is_approximate=usage_is_approximate,
         long_context_pricing=long_context,
         token_usage=token_usage,
-        cost_usd=cost_usd,
+        cost_estimate=cost_estimate,
     )
 
 
@@ -706,20 +792,26 @@ def resolve_pricing_model(
             resolution_reason="missing-model",
             excluded=True,
         )
-    if raw_model in PRICE_CATALOG:
+    canonical_model = PUBLIC_MODEL_ALIASES.get(raw_model, raw_model)
+    if canonical_model in PRICE_CATALOG:
         return ModelResolution(
             raw_model=raw_model,
-            pricing_model=raw_model,
+            pricing_model=canonical_model,
             estimated=False,
-            resolution_reason="exact",
+            resolution_reason=(
+                f"public-alias:{canonical_model}"
+                if canonical_model != raw_model
+                else "exact"
+            ),
             excluded=False,
         )
 
     base_model = strip_snapshot_suffix(raw_model)
-    if base_model in PRICE_CATALOG and base_model in SNAPSHOT_ALIASES:
+    canonical_base_model = PUBLIC_MODEL_ALIASES.get(base_model, base_model)
+    if canonical_base_model in PRICE_CATALOG and canonical_base_model in SNAPSHOT_ALIASES:
         return ModelResolution(
             raw_model=raw_model,
-            pricing_model=base_model,
+            pricing_model=canonical_base_model,
             estimated=False,
             resolution_reason="snapshot-alias",
             excluded=False,
@@ -757,22 +849,56 @@ def strip_snapshot_suffix(model_id: str) -> str:
 
 
 def compute_cost(*, pricing_model: str, token_usage: TokenUsage) -> Decimal:
+    """Return exact cost, rejecting token usage with unknown billable cache writes."""
+    estimate = compute_cost_estimate(pricing_model=pricing_model, token_usage=token_usage)
+    if not estimate.exact:
+        raise ValueError("cache_write_tokens are required for an exact GPT-5.6 cost")
+    return estimate.lower_usd
+
+
+def compute_cost_estimate(*, pricing_model: str, token_usage: TokenUsage) -> CostEstimate:
     price = PRICE_CATALOG[pricing_model]
     long_context = is_long_context_request(pricing_model, token_usage)
     input_rate = price.input_per_million
     cached_rate = price.cached_input_per_million
+    cache_write_rate = price.cache_write_per_million
     output_rate = price.output_per_million
     if long_context:
         input_rate *= price.long_context_input_multiplier
         cached_rate *= price.long_context_input_multiplier
+        if cache_write_rate is not None:
+            cache_write_rate *= price.long_context_input_multiplier
         output_rate *= price.long_context_output_multiplier
-    uncached_cost = token_cost(token_usage.uncached_input_tokens, input_rate)
     cached_cost = token_cost(token_usage.cached_input_tokens, cached_rate)
     # Reasoning tokens are already included in output_tokens in Codex rollouts.
     output_cost = token_cost(token_usage.output_tokens, output_rate)
-    return (uncached_cost + cached_cost + output_cost).quantize(
-        USD_PRECISION,
-        rounding=ROUND_HALF_UP,
+    fixed_cost = cached_cost + output_cost
+
+    if cache_write_rate is None:
+        exact_cost = fixed_cost + token_cost(token_usage.uncached_input_tokens, input_rate)
+        rounded = exact_cost.quantize(USD_PRECISION, rounding=ROUND_HALF_UP)
+        return CostEstimate(lower_usd=rounded, upper_usd=rounded)
+
+    if token_usage.cache_write_tokens is not None:
+        cache_write_tokens = min(
+            token_usage.cache_write_tokens,
+            token_usage.uncached_input_tokens,
+        )
+        exact_cost = (
+            fixed_cost
+            + token_cost(token_usage.standard_input_tokens, input_rate)
+            + token_cost(cache_write_tokens, cache_write_rate)
+        )
+        rounded = exact_cost.quantize(USD_PRECISION, rounding=ROUND_HALF_UP)
+        return CostEstimate(lower_usd=rounded, upper_usd=rounded)
+
+    ordinary_input_cost = token_cost(token_usage.uncached_input_tokens, input_rate)
+    all_cache_write_cost = token_cost(token_usage.uncached_input_tokens, cache_write_rate)
+    lower = fixed_cost + min(ordinary_input_cost, all_cache_write_cost)
+    upper = fixed_cost + max(ordinary_input_cost, all_cache_write_cost)
+    return CostEstimate(
+        lower_usd=lower.quantize(USD_PRECISION, rounding=ROUND_HALF_UP),
+        upper_usd=upper.quantize(USD_PRECISION, rounding=ROUND_HALF_UP),
     )
 
 
@@ -806,9 +932,19 @@ def summarize_events(
     total_input_tokens = sum(event.token_usage.input_tokens for event in events)
     total_cached_input_tokens = sum(event.token_usage.cached_input_tokens for event in events)
     total_uncached_input_tokens = sum(event.token_usage.uncached_input_tokens for event in events)
+    total_cache_write_tokens = sum(
+        event.token_usage.cache_write_tokens or 0 for event in events
+    )
     total_output_tokens = sum(event.token_usage.output_tokens for event in events)
     total_reasoning_output_tokens = sum(event.token_usage.reasoning_output_tokens for event in events)
-    total_cost_usd = sum((event.cost_usd or Decimal("0")) for event in events)
+    total_cost_lower_usd = sum(
+        (event.cost_estimate.lower_usd if event.cost_estimate is not None else Decimal("0"))
+        for event in events
+    )
+    total_cost_upper_usd = sum(
+        (event.cost_estimate.upper_usd if event.cost_estimate is not None else Decimal("0"))
+        for event in events
+    )
 
     by_day = defaultdict(
         lambda: {
@@ -817,9 +953,12 @@ def summarize_events(
             "input_tokens": 0,
             "cached_input_tokens": 0,
             "uncached_input_tokens": 0,
+            "cache_write_tokens": 0,
+            "cache_write_unknown_events": 0,
             "output_tokens": 0,
             "reasoning_output_tokens": 0,
-            "cost_usd": Decimal("0"),
+            "cost_lower_usd": Decimal("0"),
+            "cost_upper_usd": Decimal("0"),
         }
     )
     by_model = defaultdict(
@@ -829,9 +968,12 @@ def summarize_events(
             "input_tokens": 0,
             "cached_input_tokens": 0,
             "uncached_input_tokens": 0,
+            "cache_write_tokens": 0,
+            "cache_write_unknown_events": 0,
             "output_tokens": 0,
             "reasoning_output_tokens": 0,
-            "cost_usd": Decimal("0"),
+            "cost_lower_usd": Decimal("0"),
+            "cost_upper_usd": Decimal("0"),
             "estimated_events": 0,
             "long_context_events": 0,
         }
@@ -847,9 +989,12 @@ def summarize_events(
             "input_tokens": 0,
             "cached_input_tokens": 0,
             "uncached_input_tokens": 0,
+            "cache_write_tokens": 0,
+            "cache_write_unknown_events": 0,
             "output_tokens": 0,
             "reasoning_output_tokens": 0,
-            "cost_usd": Decimal("0"),
+            "cost_lower_usd": Decimal("0"),
+            "cost_upper_usd": Decimal("0"),
             "first_timestamp": None,
             "last_timestamp": None,
         }
@@ -863,9 +1008,14 @@ def summarize_events(
         day_row["input_tokens"] += event.token_usage.input_tokens
         day_row["cached_input_tokens"] += event.token_usage.cached_input_tokens
         day_row["uncached_input_tokens"] += event.token_usage.uncached_input_tokens
+        day_row["cache_write_tokens"] += event.token_usage.cache_write_tokens or 0
         day_row["output_tokens"] += event.token_usage.output_tokens
         day_row["reasoning_output_tokens"] += event.token_usage.reasoning_output_tokens
-        day_row["cost_usd"] += event.cost_usd or Decimal("0")
+        if event.cost_estimate is not None:
+            day_row["cost_lower_usd"] += event.cost_estimate.lower_usd
+            day_row["cost_upper_usd"] += event.cost_estimate.upper_usd
+            if not event.cost_estimate.exact:
+                day_row["cache_write_unknown_events"] += 1
 
         model_key = event.pricing_model or "unpriced"
         model_row = by_model[model_key]
@@ -874,9 +1024,14 @@ def summarize_events(
         model_row["input_tokens"] += event.token_usage.input_tokens
         model_row["cached_input_tokens"] += event.token_usage.cached_input_tokens
         model_row["uncached_input_tokens"] += event.token_usage.uncached_input_tokens
+        model_row["cache_write_tokens"] += event.token_usage.cache_write_tokens or 0
         model_row["output_tokens"] += event.token_usage.output_tokens
         model_row["reasoning_output_tokens"] += event.token_usage.reasoning_output_tokens
-        model_row["cost_usd"] += event.cost_usd or Decimal("0")
+        if event.cost_estimate is not None:
+            model_row["cost_lower_usd"] += event.cost_estimate.lower_usd
+            model_row["cost_upper_usd"] += event.cost_estimate.upper_usd
+            if not event.cost_estimate.exact:
+                model_row["cache_write_unknown_events"] += 1
         if event.estimated_model:
             model_row["estimated_events"] += 1
             estimated_mappings[f"{event.raw_model} -> {event.pricing_model}"] += 1
@@ -893,9 +1048,14 @@ def summarize_events(
         session_row["input_tokens"] += event.token_usage.input_tokens
         session_row["cached_input_tokens"] += event.token_usage.cached_input_tokens
         session_row["uncached_input_tokens"] += event.token_usage.uncached_input_tokens
+        session_row["cache_write_tokens"] += event.token_usage.cache_write_tokens or 0
         session_row["output_tokens"] += event.token_usage.output_tokens
         session_row["reasoning_output_tokens"] += event.token_usage.reasoning_output_tokens
-        session_row["cost_usd"] += event.cost_usd or Decimal("0")
+        if event.cost_estimate is not None:
+            session_row["cost_lower_usd"] += event.cost_estimate.lower_usd
+            session_row["cost_upper_usd"] += event.cost_estimate.upper_usd
+            if not event.cost_estimate.exact:
+                session_row["cache_write_unknown_events"] += 1
         first_ts = session_row["first_timestamp"]
         last_ts = session_row["last_timestamp"]
         session_row["first_timestamp"] = event.timestamp if first_ts is None or event.timestamp < first_ts else first_ts
@@ -915,6 +1075,11 @@ def summarize_events(
                 "reasoning_output_tokens are reported separately but not double-counted because "
                 "they appear to be included in output_tokens in Codex rollout token_count events"
             ),
+            "cache_write_note": (
+                "GPT-5.6 cache writes are billed at 1.25x uncached input. Codex 0.144.1 "
+                "does not persist cache_write_tokens, so affected events are reported as a "
+                "lower/upper bound."
+            ),
             "sources": SOURCE_URLS,
         },
         "scan": {
@@ -930,16 +1095,21 @@ def summarize_events(
             "approximate_usage_events": event_counter["approximate_usage"],
             "estimated_model_mapping_events": event_counter["estimated_model_mapping"],
             "long_context_pricing_events": event_counter["long_context_pricing"],
+            "missing_cache_write_usage_events": event_counter["missing_cache_write_usage"],
         },
         "totals": {
             "session_count": len(by_session),
-            "priced_session_count": sum(1 for row in by_session.values() if row["cost_usd"] > 0),
+            "priced_session_count": sum(
+                1 for row in by_session.values() if row["cost_upper_usd"] > 0
+            ),
             "input_tokens": total_input_tokens,
             "cached_input_tokens": total_cached_input_tokens,
             "uncached_input_tokens": total_uncached_input_tokens,
+            "cache_write_tokens": total_cache_write_tokens,
+            "cache_write_unknown_events": event_counter["missing_cache_write_usage"],
             "output_tokens": total_output_tokens,
             "reasoning_output_tokens": total_reasoning_output_tokens,
-            "estimated_cost_usd": decimal_to_float(total_cost_usd),
+            **cost_summary_fields(total_cost_lower_usd, total_cost_upper_usd),
         },
         "by_day": [
             {
@@ -949,9 +1119,11 @@ def summarize_events(
                 "input_tokens": row["input_tokens"],
                 "cached_input_tokens": row["cached_input_tokens"],
                 "uncached_input_tokens": row["uncached_input_tokens"],
+                "cache_write_tokens": row["cache_write_tokens"],
+                "cache_write_unknown_events": row["cache_write_unknown_events"],
                 "output_tokens": row["output_tokens"],
                 "reasoning_output_tokens": row["reasoning_output_tokens"],
-                "estimated_cost_usd": decimal_to_float(row["cost_usd"]),
+                **cost_summary_fields(row["cost_lower_usd"], row["cost_upper_usd"]),
             }
             for day, row in sorted(by_day.items())
         ],
@@ -963,15 +1135,17 @@ def summarize_events(
                 "input_tokens": row["input_tokens"],
                 "cached_input_tokens": row["cached_input_tokens"],
                 "uncached_input_tokens": row["uncached_input_tokens"],
+                "cache_write_tokens": row["cache_write_tokens"],
+                "cache_write_unknown_events": row["cache_write_unknown_events"],
                 "output_tokens": row["output_tokens"],
                 "reasoning_output_tokens": row["reasoning_output_tokens"],
-                "estimated_cost_usd": decimal_to_float(row["cost_usd"]),
+                **cost_summary_fields(row["cost_lower_usd"], row["cost_upper_usd"]),
                 "estimated_mapping_events": row["estimated_events"],
                 "long_context_events": row["long_context_events"],
             }
             for model, row in sorted(
                 by_model.items(),
-                key=lambda item: (item[1]["cost_usd"], item[1]["events"]),
+                key=lambda item: (item[1]["cost_upper_usd"], item[1]["events"]),
                 reverse=True,
             )
         ],
@@ -987,15 +1161,17 @@ def summarize_events(
                 "input_tokens": row["input_tokens"],
                 "cached_input_tokens": row["cached_input_tokens"],
                 "uncached_input_tokens": row["uncached_input_tokens"],
+                "cache_write_tokens": row["cache_write_tokens"],
+                "cache_write_unknown_events": row["cache_write_unknown_events"],
                 "output_tokens": row["output_tokens"],
                 "reasoning_output_tokens": row["reasoning_output_tokens"],
-                "estimated_cost_usd": decimal_to_float(row["cost_usd"]),
+                **cost_summary_fields(row["cost_lower_usd"], row["cost_upper_usd"]),
                 "first_timestamp": row["first_timestamp"].isoformat() if row["first_timestamp"] else None,
                 "last_timestamp": row["last_timestamp"].isoformat() if row["last_timestamp"] else None,
             }
             for session_id, row in sorted(
                 by_session.items(),
-                key=lambda item: (item[1]["cost_usd"], item[1]["events"]),
+                key=lambda item: (item[1]["cost_upper_usd"], item[1]["events"]),
                 reverse=True,
             )
         ],
@@ -1029,6 +1205,15 @@ def timezone_name(value: tzinfo) -> str:
         return key
     tzname = value.tzname(datetime.now())
     return tzname or str(value)
+
+
+def cost_summary_fields(lower: Decimal, upper: Decimal) -> dict[str, float | None]:
+    exact = lower == upper
+    return {
+        "estimated_cost_usd": decimal_to_float(lower) if exact else None,
+        "estimated_cost_lower_usd": decimal_to_float(lower),
+        "estimated_cost_upper_usd": decimal_to_float(upper),
+    }
 
 
 def decimal_to_float(value: Decimal) -> float:
@@ -1074,17 +1259,22 @@ def render_human_report(report: dict[str, Any]) -> str:
         f"Rollouts scanned: {scan['rollouts_scanned']} | events in range: {scan['usage_events_in_range']} | "
         f"priced: {scan['priced_events']} | unpriced: {scan['unpriced_events']}"
     )
-    lines.append(
-        f"Estimated cost: {format_usd(Decimal(str(totals['estimated_cost_usd'])))}"
-    )
+    lines.append(f"Estimated cost: {format_report_cost(totals)}")
     lines.append(
         "Tokens: "
         f"input={format_int(totals['input_tokens'])} "
         f"uncached_input={format_int(totals['uncached_input_tokens'])} "
         f"cached_input={format_int(totals['cached_input_tokens'])} "
+        f"cache_write_known={format_int(totals['cache_write_tokens'])} "
         f"output={format_int(totals['output_tokens'])} "
         f"reasoning={format_int(totals['reasoning_output_tokens'])}"
     )
+    if totals["cache_write_unknown_events"]:
+        lines.append(
+            "Cache-write accounting: "
+            f"{format_int(totals['cache_write_unknown_events'])} GPT-5.6 usage events lack "
+            "persisted cache_write_tokens; the displayed cost is a bounded range."
+        )
     lines.append(
         "Note: reasoning tokens are surfaced separately but not double-counted in the billed total "
         "because rollout output tokens already appear to include them."
@@ -1095,7 +1285,7 @@ def render_human_report(report: dict[str, Any]) -> str:
         lines.append("By Day")
         for row in report["by_day"]:
             lines.append(
-                f"{row['day']}: {format_usd(Decimal(str(row['estimated_cost_usd'])))} | "
+                f"{row['day']}: {format_report_cost(row)} | "
                 f"events={row['events']} | sessions={row['session_count']} | "
                 f"input={format_int(row['input_tokens'])} | output={format_int(row['output_tokens'])}"
             )
@@ -1109,8 +1299,10 @@ def render_human_report(report: dict[str, Any]) -> str:
                 suffix += f" | estimated_mappings={row['estimated_mapping_events']}"
             if row["long_context_events"]:
                 suffix += f" | long_context={row['long_context_events']}"
+            if row["cache_write_unknown_events"]:
+                suffix += f" | unknown_cache_writes={row['cache_write_unknown_events']}"
             lines.append(
-                f"{row['model']}: {format_usd(Decimal(str(row['estimated_cost_usd'])))} | "
+                f"{row['model']}: {format_report_cost(row)} | "
                 f"events={row['events']} | sessions={row['session_count']} | "
                 f"input={format_int(row['input_tokens'])} | output={format_int(row['output_tokens'])}{suffix}"
             )
@@ -1122,7 +1314,7 @@ def render_human_report(report: dict[str, Any]) -> str:
             model_list = ", ".join(row["models"].keys()) or "unknown"
             title = row["thread_name"] or row["session_id"]
             lines.append(
-                f"{title}: {format_usd(Decimal(str(row['estimated_cost_usd'])))} | "
+                f"{title}: {format_report_cost(row)} | "
                 f"models={model_list} | events={row['events']} | path={row['path']}"
             )
 
@@ -1153,6 +1345,20 @@ def render_human_report(report: dict[str, Any]) -> str:
 
 def format_usd(amount: Decimal) -> str:
     return f"${amount.quantize(USD_DISPLAY_PRECISION, rounding=ROUND_HALF_UP):,.2f}"
+
+
+def format_report_cost(row: dict[str, Any]) -> str:
+    exact = row.get("estimated_cost_usd")
+    if exact is not None:
+        return format_usd(Decimal(str(exact)))
+    lower = Decimal(str(row["estimated_cost_lower_usd"]))
+    upper = Decimal(str(row["estimated_cost_upper_usd"]))
+    lower_display = format_usd(lower)
+    upper_display = format_usd(upper)
+    if lower_display == upper_display and lower != upper:
+        lower_display = f"${lower.quantize(USD_PRECISION, rounding=ROUND_HALF_UP):,.6f}"
+        upper_display = f"${upper.quantize(USD_PRECISION, rounding=ROUND_HALF_UP):,.6f}"
+    return f"{lower_display}–{upper_display}"
 
 
 def format_int(value: int) -> str:
